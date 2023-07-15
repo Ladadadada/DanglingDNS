@@ -1,0 +1,7 @@
+# Seed URLs are for sites where the home page does not contain any identifying clues but other pages on the site do.
+# You can include any URLs for any domains in here.
+# If you include multiple URLs for the same domain, DanglingDNS will request all of them. (Not implemented yet.)
+# When DanglingDNS is evaluating a domain that exists in this file it will use the paths here instead of /.
+
+https://email.example.com/subscribe/newsletter     # Our newsletter subscription service has nothing on the home page.
+https://shorturl.example.net/LinkInOurSocialMedia  # Our URL shortening service has nothing on the home page.

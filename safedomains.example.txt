@@ -1,0 +1,8 @@
+# Safe domains are domains that you use daily or manually check regularly
+# Any domain that would be immediately noticed if it was pointing to the wrong place.
+# Even dev domains can cause false negatives in here if for instance you decommission
+# your staging environment but forget to delete the staging.example.com record.
+
+# example.net
+example.com
+www.example.com # Canonical domain for the main website
