@@ -1,0 +1,23 @@
+# Safe strings are the key to categorising Dangling DNS records.
+# These are strings that have a high likelihood of being found on your website(s) and not found on any other website
+# Safestrings can include whitespace but not trailing or leading whitespace
+# Some examples are:
+#  Your Analytics ID
+#  Facebook App ID
+#  Twitter Handle
+#  Your office phone number
+#  Your office address
+#  Links to other websites you own
+
+GTM-6YCP3LZ                                 # GTM ID
+320949621749168                             # Facebook App ID
+7LsxhGBUD7xSrQa7xE3I1WO9TAFEKaGBYwKFXU4yPS7 # google-site-verification
+https://api.example.com                     # API URL
+static.example.com                          # Static assets subdomain
+https://www.example.com                     # https link to main website
+https://example.com                         # https link to bare domain
+658961                                      # Business Number
+07700 900 982                               # Phone number
+07700900982                                 # Phone number without spaces.
++44 7700 900 982                            # Phone number with country code
+EC1A 1BB                                    # Postcode of head office

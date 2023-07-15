@@ -1,0 +1,12 @@
+# Safe IPs are IP ranges that you own.
+# Not an IP owned by another company that you point a DNS record to.
+# Not anything that is auto-assigned by another company.
+# If who controls the IP can change without you knowing then it doesn't belong here.
+# If you relinquish control of the IP and forget to remove it from this file you will get false negatives.
+# This list will probably be empty for most people and should be configured last, after all the other safe files.
+
+# The script does not yet support IPv6 but coding in support is in the backlog.
+# IPv6 addresses added here won't cause an error but they won't work.
+
+203.0.113.0/24 # A range in CIDR notation.
+233.252.0.55   # A bare IPv4 address.
