@@ -8,6 +8,15 @@ The risk they pose is that someone else will one day gain control of that IP add
 
 A dangling MX record will mean that any email sent to that domain will be received by whoever now controls the IP address
 
+# Who is this for?
+At a startup you often only have one domain with a handful of subdomains. It's only a few minutes work to look through them manually and verify that they are all pointing at an IP address you control. But you probably only do this monthly at best and more likely yearly when your security audit comes around. DanglingDNS can be configured to run daily and alert you to any dangling DNS records as soon as they happen.
+
+At a medium sized business the DNS landscape is more complicated. You may have many domains and hundreds of DNS records built up over decades, managed by different areas of the business that all operate on their own schedule. Manually running through all your records centrally becomes a daunting task even on a yearly basis and the various teams don't necessarily have the security training, understanding or incentive to do the job themselves.
+
+At a large business where the number of DNS records is in the tens or hundreds of thousands nearly all of these will be created automatically by scripts or infrastructure as code and will be created and destroyed along with the resources they point to. You may also own your own IP address ranges and even data centres. Dangling DNS records will be an almost non-existant problem, however the stakes are much higher at this scale and if even a single record is taken over the number of users compromised could be in the millions. The more quickly you can detect and remove at-risk records the better. A daily scan of the entire estate or subsets of records is one way to reduce that risk.
+
+Security researchers, bug bounty hunters, red teams and penetration testers already have tools to guess what subdomains exist for a given domain but still face the same problem when trying to categorise them. DanglingDNS can help you rule out the records that are safe and concentrate on investigating the risky ones.
+
 # How does it work?
 DanglingDNS works by making HTTP requests to your DNS records and looking for clues in the responses (or lack of response) that the IP address it points to is controlled by you. Clues can be either positive (more likely that you control the IP) or negative (less likely that you own the IP). The positive clues are based on information that you put into the "safe" configuration files. For instance, if you use Google Analytics on your sites then the HTTP responses will contain your Google Analytics ID. The same works for your Facebook and Twitter IDs if you have social media buttons on your website.
 If you own a range of IP addresses you can put those into the safeips file.
@@ -45,3 +54,5 @@ Suspicious signals
 -  The record points to an S3 bucket but we can't verify that we own the bucket.
 -  The record points to an unknown domain
 -    This is really just the "known domain" pattern which I already think isn't a good idea.
+-  An HTTPS response includes an SSL certificate that does not contain the record or the parent domain name.
+-    Except if the certificate presented is for a valid domain. Lots of parked domains only work on http.

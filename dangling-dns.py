@@ -13,6 +13,11 @@ import os
 import time  
 from datetime import datetime
 
+# SSL stuff
+import ssl
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+
 import argparse
 
 # Globals
@@ -146,7 +151,7 @@ def loadDNSRecords():
   for record in loadedrecords:
     if(record['Type'] == 'A' or record['Type'] == 'CNAME'):
       # Strip off trailing dots as we go.
-      if(record['Name'][:-1] == '.'):
+      if(record['Name'][-1] == '.'):
         record['Name'] = record['Name'][:-1]
       records[record['Name']] = record
       records[record['Name']]['Score'] = 0
@@ -175,6 +180,19 @@ def retrySession(retries, session=None, backoff_factor=0.3):
   session.mount('https://', adapter)
   return session
 
+
+def getTLSNames(domain):
+  certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
+  loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
+  common_name = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+  log(common_name, "debug")
+  # classes must be subtype of:
+  #   https://cryptography.io/en/latest/x509/reference/#cryptography.x509.ExtensionType
+  san = loaded_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+  san_dns_names = san.value.get_values_for_type(x509.DNSName)
+  return san_dns_names
+
+
 def get_ipv4_by_hostname(hostname):
   if('ips' in records[hostname]):
     stats['dns_cached'] += 1
@@ -202,6 +220,11 @@ def getHttp(url):
   else:
     stats['http_requests'] += 1
   session = retrySession(retries=0)
+  # Possible errors:
+  #   ReadTimeout
+  #   ConnectTimeout
+  #   Timeout
+  #   ConnectionError
   try:
     log(f"Requesting {url}", "debug")
     start_time = time.time()
@@ -213,13 +236,9 @@ def getHttp(url):
   except requests.exceptions.SSLError as e:
     log(f"SSL error: {e} caused by {url}", "tmpdebug")
     return None, e
-# ReadTimeout
-# ConnectTimeout
-# Timeout
-# ConnectionError
   except Exception as e:
     stats['wait_time'] += (time.time() - start_time)
-    log(f"Http error: {e} caused by {url}", "tmpdebug")
+    log(f"HTTP error: {e} caused by {url}", "tmpdebug")
     if(time.time() - start_time > 3):
       domain = urlparse(url).netloc
       ips = get_ipv4_by_hostname(domain)
@@ -367,6 +386,7 @@ while(changed > 0):
     elif(len(ips) > 0 and ips[0] in timeoutIPs):
       log(f"IP is known to time out, not requesting again: {record} {get_ipv4_by_hostname(record)[0]}", "tmpdebug")
 
+    ##### Start the HTTP requests #####
     else:
       if(record in seedurls):
         url = seedurls[record]
@@ -377,12 +397,44 @@ while(changed > 0):
 
       if(response is None):
         if('Hostname mismatch' in str(errors)):
-          log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
-          adjustScore(record, -50)
+          # Check to see what SANs the cert has. Maybe one of them is a clue.
+          sans = getTLSNames(record)
+          found = False
+          for san in sans:
+            if san in safedomains:
+              found = True
+              log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
+              adjustScore(record, 50)
+          if not found:
+            log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+            adjustScore(record, -50)
+
           response = None
+
+        elif('HANDSHAKE_FAILURE' in str(errors)):
+          # Listening on 443 but failing to present a certificate? Try again on http.
+          url = url.replace('s', '', 1)
+          response, errors = getHttp(url)
+
+        elif('SSLEOFError' in str(errors)):
+          # Listening on 443 but failing to present a certificate? Try again on http.
+          url = url.replace('s', '', 1)
+          response, errors = getHttp(url)
+
         elif('SSLError' in str(errors)):
-          log(f"Lowering score for other SSL error: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25}))", "tmpdebug")
-          adjustScore(record, -25)
+          # Check to see what SANs the cert has. Maybe one of them is a clue.
+          sans = getTLSNames(record)
+          pprint(f"SANS for {record}")
+          found = False
+          for san in sans:
+            if san in safedomains:
+              found = True
+              log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
+              adjustScore(record, 50)
+          if not found:
+            log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+            adjustScore(record, -50)
+
           response = None
         elif('Timeout' in str(errors)):
           # Try again on http.
