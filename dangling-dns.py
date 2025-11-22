@@ -185,23 +185,6 @@ def retrySession(retries, session=None, backoff_factor=0.3):
   session.mount('https://', adapter)
   return session
 
-
-def getTLSNames(domain):
-  try:
-    certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
-    loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
-    common_name = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
-    log(common_name, "debug")
-    # classes must be subtype of:
-    #   https://cryptography.io/en/latest/x509/reference/#cryptography.x509.ExtensionType
-    san = loaded_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-    san_dns_names = san.value.get_values_for_type(x509.DNSName)
-  except Exception as e:
-    log(f"Error getting SAN DNS names for {domain}: {e}", "debug")
-    san_dns_names = []
-  return san_dns_names
-
-
 def get_ipv4_by_hostname(hostname):
   if('ips' in records[hostname]):
     stats['dns_cached'] += 1
@@ -317,6 +300,20 @@ def follow_redirects(response, url):
   # If we exit due to too many redirects, do nothing here (handled in analyse_http)
   return changed
 
+def get_tls_names(domain):
+  try:
+    certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
+    loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
+    common_name = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+    log(common_name, "debug")
+    # classes must be subtype of:
+    #   https://cryptography.io/en/latest/x509/reference/#cryptography.x509.ExtensionType
+    san = loaded_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    san_dns_names = san.value.get_values_for_type(x509.DNSName)
+  except Exception as e:
+    log(f"Error getting SAN DNS names for {domain}: {e}", "debug")
+    san_dns_names = []
+  return san_dns_names
 
 def check_tls_status(url, response, errors, changed):
   global record
@@ -329,7 +326,7 @@ def check_tls_status(url, response, errors, changed):
   if response is None:
     if('Hostname mismatch' in str(errors) or 'SSLError' in str(errors)):
       # Check to see what SANs the cert has. Maybe one of them is a clue.
-      sans = getTLSNames(record)
+      sans = get_tls_names(record)
       log(f"SANS for {record}", "debug")
       found = False
       for san in sans:
@@ -394,38 +391,37 @@ changed=1
 while(changed > 0):
   changed=0
   for record in records:
-    if('_' not in record
-        and records[record]['Type'] != 'SOA'
-        and records[record]['Type'] != 'TXT'
-        and records[record]['Type'] != 'NS'
-        and records[record]['Type'] != 'MX'
-        and records[record]['Type'] != 'PTR'):
-      ips = get_ipv4_by_hostname(record)
+    if('_' in record):
+      # DNS records with underscores can't resolve to an IP address.
+      adjust_score(record, 100, "Record with underscore")
+      log(f"Ignoring records with underscores ({record})", "debug")
+      pass
 
+    if(records[record]['Type'] == 'SOA'
+      or records[record]['Type'] == 'TXT'
+      or records[record]['Type'] == 'NS'
+      or records[record]['Type'] == 'MX'
+      or records[record]['Type'] == 'PTR'):
+      # MX and NS are not supported yet but will be in the future.
+      log(f"Ignoring {records[record]['Type']} records ({records[record]['Name']})", "debug")
+      pass
+
+    # Now that we have filtered out anything that can't resolve, get the IPs
+    ips = get_ipv4_by_hostname(record)
+
+    # Check for anything that has already passed the score threashold
     if(records[record]['Score'] > 99 and record in safedomains):
       log(f"Already safe: {records[record]['Score']} ({record})", "debug")
 
     elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
       log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
 
-    elif('_' in record):
-      # DNS records with underscores can't resolve to an IP address.
-      adjust_score(record, 100, "Record with underscore")
-      log(f"Ignoring records with underscores ({record})", "debug")
-      pass
-
     elif(records[record]['Score'] > 99 and not record in safedomains):
       log(f"Already safe: {records[record]['Score']} ({record})", "debug")
       safedomains.append(record)
       changed += 1
 
-    elif(records[record]['Type'] == 'SOA'
-      or records[record]['Type'] == 'TXT'
-      or records[record]['Type'] == 'NS'
-      or records[record]['Type'] == 'MX'
-      or records[record]['Type'] == 'PTR'):
-      log(f"Ignoring {records[record]['Type']} records ({records[record]['Name']})", "debug")
-
+    # Check DNS lookup failures early so we can assume we have IPs from here on.
     elif(not ips):
       log(f"DNS Lookup failure: {record} {ips}", "debug")
       adjust_score(record, -100, "DNS lookup failure")
@@ -452,7 +448,7 @@ while(changed > 0):
       changed += 1
 
     elif(records[record]["Type"] == "CNAME"
-      and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
+      and re.findall('.*\d*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
       log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
       adjust_score(record, 100, "CNAME points to high entropy ELB domain")
       changed += 1
