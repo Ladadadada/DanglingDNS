@@ -30,6 +30,8 @@ stats = {
   'start_time': time.time()
 }
 
+# Progress meter. Count the number of records during loading. Show percentage that are certain.
+
 args = None
 
 safedomains = []
@@ -67,9 +69,10 @@ def parseOptions():
   global args
   args = parser.parse_args()
 
-  print(args.debug)
-  print(args.score)
-  print(args.input)
+  print("Parsed args:")
+  print(f"Debug: {args.debug}")
+  print(f"Score: {args.score}")
+  print(f"Input file: {args.input}")
 
 def loadSafeDomains():
   # Load safedomains from safedomains.txt
@@ -79,7 +82,7 @@ def loadSafeDomains():
     # Remove comments
     line = re.sub("#.*", "", line)
     # Remove trailing dots
-    line = re.sub("\.$", "", line)
+    line = re.sub(r"\.$", "", line)
     # Remove whitespace
     line = re.sub("[ \n]", "", line)
     if line != "":
@@ -153,6 +156,8 @@ def loadDNSRecords():
       # Strip off trailing dots as we go.
       if(record['Name'][-1] == '.'):
         record['Name'] = record['Name'][:-1]
+      if('ResourceRecords' in record):
+        record['ResourceRecords'] = sorted(record['ResourceRecords'], key=lambda d: d['Value']) # Sort these so that we can compare them day to day.
       records[record['Name']] = record
       records[record['Name']]['Score'] = 0
   del loadedrecords
@@ -182,14 +187,18 @@ def retrySession(retries, session=None, backoff_factor=0.3):
 
 
 def getTLSNames(domain):
-  certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
-  loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
-  common_name = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
-  log(common_name, "debug")
-  # classes must be subtype of:
-  #   https://cryptography.io/en/latest/x509/reference/#cryptography.x509.ExtensionType
-  san = loaded_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-  san_dns_names = san.value.get_values_for_type(x509.DNSName)
+  try:
+    certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
+    loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
+    common_name = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+    log(common_name, "debug")
+    # classes must be subtype of:
+    #   https://cryptography.io/en/latest/x509/reference/#cryptography.x509.ExtensionType
+    san = loaded_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    san_dns_names = san.value.get_values_for_type(x509.DNSName)
+  except Exception as e:
+    log(f"Error getting SAN DNS names for {domain}: {e}", "debug")
+    san_dns_names = []
   return san_dns_names
 
 
@@ -204,8 +213,8 @@ def get_ipv4_by_hostname(hostname):
     for i in socket.getaddrinfo(hostname, 0):
       if( i[0] is socket.AddressFamily.AF_INET and i[1] is socket.SocketKind.SOCK_STREAM):
         ips.append(i[4][0])
-    records[hostname]['ips'] = ips
-    return ips
+    records[hostname]['ips'] = sorted(ips)
+    return sorted(ips)
   except Exception as e:
     if(e is socket.gaierror):
       log(f"DNS failed to resolve for {hostname}.", "debug")
@@ -251,8 +260,100 @@ def getHttp(url):
       log(f"Slow response from {url}: {time.time() - start_time}. Adding {ips} to timeoutIPs", "tmpdebug")
     return None, e
 
-def adjustScore(record, scoreChange):
-  records[record]['Score'] += scoreChange
+
+def analyse_http(url):
+
+  response, errors = getHttp(url)
+  changed = 0
+
+  # Handle SSL-related errors and scoring
+  response, errors, changed = check_tls_status(url, response, errors, changed)
+
+  if(response is not None and response.status_code > 100 and response.status_code < 600):
+    log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
+    adjust_score(record, 25, "Matching TLS cert")
+
+  if(response is None):
+    if('Timeout' in str(errors)):
+      log(f"Lowering score for no http(s) response: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+      adjust_score(record, -50, "No http(s) response")
+      changed += 1
+    else:
+      log(f"Other http error {str(errors)}", "tmpdebug")
+
+  elif(response.status_code > 100 and response.status_code < 600):
+    for safestring in safestrings:
+      log(f"Looking for {safestring} in https://{record}", "debug")
+      if(safestring.encode('utf-8') in response.content):
+        log(f"Increasing score for safestring: {record} ({safestring}) ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
+        adjust_score(record, 50, "Safestring found")
+        changed += 1
+    redirectchain = 0
+    while(response is not None and 'location' in response.headers and redirectchain < 10):
+      # If the redirect target is on the safe list, add 100.
+      domain = urlparse(response.headers['location']).netloc
+      if(domain in safedomains):
+        log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+        adjust_score(record, 100, "Redirect to safedomain")
+        changed += 1
+        redirectchain += 5 # Silly hack to prevent infinite loop here.
+      else:
+        # If this is a path, add the domain and protocol. If this has no protocol, add one.
+        log(f"Following redirect from {url} to {response.headers['location']}", "tmpdebug")
+        redirectchain += 1
+        url = response.headers['location']
+        if(url[:2] == '//'):
+          url = f"https:{url}"
+          log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
+        elif(url[:1] == '/'):
+          url = f"https://{record}{url}"
+          log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
+        response, errors = getHttp(url)
+  else:
+    log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "tmpdebug")
+
+  return changed
+
+
+def check_tls_status(url, response, errors, changed):
+  global record
+  if response is None:
+    if('Hostname mismatch' in str(errors) or 'SSLError' in str(errors)):
+      # Check to see what SANs the cert has. Maybe one of them is a clue.
+      sans = getTLSNames(record)
+      log(f"SANS for {record}", "debug")
+      found = False
+      for san in sans:
+        if san in safedomains:
+          found = True
+          log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
+          adjust_score(record, 50, "Safedomain found in TLS SAN")
+      if not found:
+        log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+        adjust_score(record, -50, "Non-matching TLS cert")
+      response = None
+    elif('HANDSHAKE_FAILURE' in str(errors)):
+      # Listening on 443 but failing to present a certificate? Try again on http.
+      url = url.replace('s', '', 1)
+      response, errors = getHttp(url)
+    elif('SSLEOFError' in str(errors)):
+      # Listening on 443 but failing to present a certificate? Try again on http.
+      url = url.replace('s', '', 1)
+      response, errors = getHttp(url)
+    elif('Timeout' in str(errors)):
+      # Try again on http.
+      url = url.replace('s', '', 1)
+      response, errors = getHttp(url)
+  return response, errors, changed
+
+
+
+def adjust_score(record, score_change, reason = "Unknown"):
+  records[record]['Score'] += score_change
+  if 'causes' in records[record]:
+    records[record]['causes'].append(reason)
+  else:
+    records[record]['causes'] = [reason]
   # If this score change pushes the record over a threshold (+100 or -100) then cascade changes to related domains and IPs
   if(records[record]['Score'] > 99):
     log(f"Score change for {record} means it is now safe: {records[record]['Score']}", "debug")
@@ -284,6 +385,8 @@ loadDNSRecords()
 
 # Main loop
 # filter out everything we can without network requests
+# Some of these can be taken over if they are dangling but we don't support them yet
+# I have seen NS record takeovers in the wild and MX records are theoretically possible
 changed=1
 while(changed > 0):
   changed=0
@@ -296,9 +399,15 @@ while(changed > 0):
         and records[record]['Type'] != 'PTR'):
       ips = get_ipv4_by_hostname(record)
 
-    if('_' in record):
+    if(records[record]['Score'] > 99 and record in safedomains):
+      log(f"Already safe: {records[record]['Score']} ({record})", "debug")
+
+    elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
+      log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
+
+    elif('_' in record):
       # DNS records with underscores can't resolve to an IP address.
-      adjustScore(record, 100)
+      adjust_score(record, 100, "Record with underscore")
       log(f"Ignoring records with underscores ({record})", "debug")
       pass
 
@@ -306,12 +415,6 @@ while(changed > 0):
       log(f"Already safe: {records[record]['Score']} ({record})", "debug")
       safedomains.append(record)
       changed += 1
-
-    elif(records[record]['Score'] > 99 and record in safedomains):
-      log(f"Already safe: {records[record]['Score']} ({record})", "debug")
-
-    elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
-      log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
 
     elif(records[record]['Type'] == 'SOA'
       or records[record]['Type'] == 'TXT'
@@ -322,19 +425,19 @@ while(changed > 0):
 
     elif(not ips):
       log(f"DNS Lookup failure: {record} {ips}", "debug")
-      adjustScore(record, -100)
+      adjust_score(record, -100, "DNS lookup failure")
 
     elif(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
       and ( records[record]['ResourceRecords'][0]['Value'][:3] == '10.' or records[record]['ResourceRecords'][0]['Value'][:8] == '192.168.')):
       log(f"Private range safe: ({record} -> {records[record]['ResourceRecords'][0]['Value']}) ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      adjust_score(record, 100, "Private range")
       changed += 1
 
     elif(records[record]["Type"] == "CNAME"
       and records[record]['ResourceRecords'][0]['Value'] in safedomains):
       # Check what the CNAME points to. If it's a domain we have already decided is safe then this one is safe as well.
       log(f"Raising score for CNAME pointing to {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      adjust_score(record, 100, "CNAME points to safedomain")
       changed += 1
 
     elif(records[record]["Type"] == "A"
@@ -342,29 +445,29 @@ while(changed > 0):
       and records[record]['AliasTarget']['DNSName'] in safedomains):
       # Check what the Alias points to. If it's a domain we have already decided is safe then this one is safe as well.
       log(f"Raising score for Alias pointing to {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      adjust_score(record, 100, "Alias points to safedomain")
       changed += 1
 
     elif(records[record]["Type"] == "CNAME"
       and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
-      log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+      adjust_score(record, 100, "CNAME points to high entropy ELB domain")
       changed += 1
 
     elif(records[record]["Type"] == "A"
       and 'AliasTarget' in records[record]
       and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
       log(f"Raising score for Alias pointing to high entropy domain {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      adjust_score(record, 100, "Alias points to high entropy domain")
       changed += 1
       if(records[record]['AliasTarget']['DNSName'][:-1] not in safedomains):
         safedomains.append(records[record]['AliasTarget']['DNSName'][:-1])
 
     elif(records[record]["Type"] == "CNAME"
-      and re.findall('.*\.s3-website-eu-west-1.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
+      and re.findall(r'.*\.s3-website-eu-west-1.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
       # TODO: Search for the S3 bucket here. This is high risk if we don't own the bucket.
       log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-      adjustScore(record, 100)
+      adjust_score(record, 100, "CNAME points to high entropy S3 domain")
       changed += 1
 
     elif(records[record]["Type"] == "A"
@@ -372,7 +475,7 @@ while(changed > 0):
       and re.findall('s3-website-eu-west-1.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
       # TODO: Search for the S3 bucket here. Finding it would be +100.
       log(f"Lowering score for Alias pointing to generic S3 endpoint {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25})", "tmpdebug")
-      adjustScore(record, -25)
+      adjust_score(record, -25, "Alias points to S3 endpoint")
       # We should still do an http request if this is negative. Maybe the response could give us a clue. No https for this domain though.
       changed += 1
 
@@ -393,98 +496,7 @@ while(changed > 0):
       else:
         url = f"https://{record}/"
 
-      response, errors = getHttp(url)
-
-      if(response is None):
-        if('Hostname mismatch' in str(errors)):
-          # Check to see what SANs the cert has. Maybe one of them is a clue.
-          sans = getTLSNames(record)
-          found = False
-          for san in sans:
-            if san in safedomains:
-              found = True
-              log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
-              adjustScore(record, 50)
-          if not found:
-            log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
-            adjustScore(record, -50)
-
-          response = None
-
-        elif('HANDSHAKE_FAILURE' in str(errors)):
-          # Listening on 443 but failing to present a certificate? Try again on http.
-          url = url.replace('s', '', 1)
-          response, errors = getHttp(url)
-
-        elif('SSLEOFError' in str(errors)):
-          # Listening on 443 but failing to present a certificate? Try again on http.
-          url = url.replace('s', '', 1)
-          response, errors = getHttp(url)
-
-        elif('SSLError' in str(errors)):
-          # Check to see what SANs the cert has. Maybe one of them is a clue.
-          sans = getTLSNames(record)
-          pprint(f"SANS for {record}")
-          found = False
-          for san in sans:
-            if san in safedomains:
-              found = True
-              log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
-              adjustScore(record, 50)
-          if not found:
-            log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
-            adjustScore(record, -50)
-
-          response = None
-        elif('Timeout' in str(errors)):
-          # Try again on http.
-          url = url.replace('s', '', 1)
-          response, errors = getHttp(url)
-
-      if(response is not None and response.status_code > 100 and response.status_code < 600):
-        log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
-        adjustScore(record, 25)
-
-      if(response is None):
-        if('Timeout' in str(errors)):
-          log(f"Lowering score for no http(s) response: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
-          adjustScore(record, -50)
-          changed += 1
-        else:
-          log(f"Other http error {str(errors)}", "tmpdebug")
-
-      elif(response.status_code > 100 and response.status_code < 600):
-        for safestring in safestrings:
-          log(f"Looking for {safestring} in https://{record}", "debug")
-          if(safestring.encode('utf-8') in response.content):
-            log(f"Increasing score for safestring: {record} ({safestring}) ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
-            #records[record]['Score'] = records[record]['Score'] + 50
-            adjustScore(record, 50)
-            changed += 1
-        redirectchain = 0
-        while(response is not None and 'location' in response.headers and redirectchain < 10):
-          # If the redirect target is on the safe list, add 100.
-          domain = urlparse(response.headers['location']).netloc
-          if(domain in safedomains):
-            log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-            adjustScore(record, 100)
-            #records[record]['Score'] = records[record]['Score'] + 100
-            changed += 1
-            redirectchain += 5 # Silly hack to prevent infinite loop here.
-          else:
-            # If this is a path, add the domain and protocol. If this has no protocol, add one.
-            log(f"Following redirect from {url} to {response.headers['location']}", "tmpdebug")
-            redirectchain += 1
-            url = response.headers['location']
-            if(url[:2] == '//'):
-              url = f"https:{url}"
-              log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
-            elif(url[:1] == '/'):
-              url = f"https://{record}{url}"
-              log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
-            response, errors = getHttp(url)
-      else:
-        log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "tmpdebug")
+      changed += analyse_http(url)
 
   log(f"Changed {changed} scores during this loop.", "tmpdebug")
   log(f"safedomains now contains {len(safedomains)} domains.", "tmpdebug")
@@ -503,6 +515,13 @@ for record in records:
   else:
     summary['safe'] = summary['safe'] + 1
     #log(f"{record}: {records[record]['Score']}", "info")
+
+# Save records with scores to file
+now = datetime.now() # current date and time
+date = now.strftime("%Y-%m-%d")
+filename = f"records_{date}.json"
+with open(filename, 'w') as f:
+  json.dump(records, f, indent=2)
 
 # Output results
 pprint(summary)
