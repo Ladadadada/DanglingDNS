@@ -269,10 +269,6 @@ def analyse_http(url):
   # Handle SSL-related errors and scoring
   response, errors, changed = check_tls_status(url, response, errors, changed)
 
-  if(response is not None and response.status_code > 100 and response.status_code < 600):
-    log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
-    adjust_score(record, 25, "Matching TLS cert")
-
   if(response is None):
     if('Timeout' in str(errors)):
       log(f"Lowering score for no http(s) response: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
@@ -288,35 +284,48 @@ def analyse_http(url):
         log(f"Increasing score for safestring: {record} ({safestring}) ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
         adjust_score(record, 50, "Safestring found")
         changed += 1
-    redirectchain = 0
-    while(response is not None and 'location' in response.headers and redirectchain < 10):
-      # If the redirect target is on the safe list, add 100.
-      domain = urlparse(response.headers['location']).netloc
-      if(domain in safedomains):
-        log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "Redirect to safedomain")
-        changed += 1
-        redirectchain += 5 # Silly hack to prevent infinite loop here.
-      else:
-        # If this is a path, add the domain and protocol. If this has no protocol, add one.
-        log(f"Following redirect from {url} to {response.headers['location']}", "tmpdebug")
-        redirectchain += 1
-        url = response.headers['location']
-        if(url[:2] == '//'):
-          url = f"https:{url}"
-          log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
-        elif(url[:1] == '/'):
-          url = f"https://{record}{url}"
-          log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
-        response, errors = getHttp(url)
+    changed += follow_redirects(response, url)
   else:
     log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "tmpdebug")
+  return changed
 
+def follow_redirects(response, url):
+  changed = 0
+  redirectchain = 0
+  global record
+  while(response is not None and 'location' in response.headers and redirectchain < 10):
+    # If the redirect target is on the safe list, add 100.
+    domain = urlparse(response.headers['location']).netloc
+    if(domain in safedomains):
+      log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+      adjust_score(record, 100, "Redirect to safedomain")
+      changed += 1
+      redirectchain += 5 # Silly hack to prevent infinite loop here.
+      break
+    else:
+      # If this is a path, add the domain and protocol. If this has no protocol, add one.
+      log(f"Following redirect from {url} to {response.headers['location']}", "tmpdebug")
+      redirectchain += 1
+      url = response.headers['location']
+      if url.startswith('//'):
+        url = f"https:{url}"
+        log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
+      elif url.startswith('/'):
+        url = f"https://{record}{url}"
+        log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
+      response, _ = getHttp(url)
+  # If we exit due to too many redirects, do nothing here (handled in analyse_http)
   return changed
 
 
 def check_tls_status(url, response, errors, changed):
   global record
+
+  # If we got a valid HTTP response, raise score for correct SSL cert
+  if response is not None and response.status_code > 100 and response.status_code < 600:
+    log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
+    adjust_score(record, 25, "Matching TLS cert")
+
   if response is None:
     if('Hostname mismatch' in str(errors) or 'SSLError' in str(errors)):
       # Check to see what SANs the cert has. Maybe one of them is a clue.
@@ -332,21 +341,15 @@ def check_tls_status(url, response, errors, changed):
         log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
         adjust_score(record, -50, "Non-matching TLS cert")
       response = None
-    elif('HANDSHAKE_FAILURE' in str(errors)):
-      # Listening on 443 but failing to present a certificate? Try again on http.
-      url = url.replace('s', '', 1)
-      response, errors = getHttp(url)
-    elif('SSLEOFError' in str(errors)):
-      # Listening on 443 but failing to present a certificate? Try again on http.
-      url = url.replace('s', '', 1)
-      response, errors = getHttp(url)
-    elif('Timeout' in str(errors)):
-      # Try again on http.
+    elif(
+      'HANDSHAKE_FAILURE' in str(errors)
+      or 'SSLEOFError' in str(errors)
+      or 'Timeout' in str(errors)
+    ):
+      # Listening on 443 but failing to present a certificate, or not listening. Try again on http.
       url = url.replace('s', '', 1)
       response, errors = getHttp(url)
   return response, errors, changed
-
-
 
 def adjust_score(record, score_change, reason = "Unknown"):
   records[record]['Score'] += score_change
