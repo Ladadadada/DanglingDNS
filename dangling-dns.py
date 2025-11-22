@@ -47,7 +47,6 @@ timeoutIPs = []
 timeoutDomains = []
 
 def parseOptions():
-
   # Potential options:
   # -d --debug debug mode
   # -s --score <number> The maximum score to include in the output. Anything higher than this will not be printed.
@@ -68,6 +67,10 @@ def parseOptions():
   parser.add_argument('-i', '--input', type=str, default='./records.txt',
                       help='An input file full of DNS records. Default: ./records.txt')
 
+  # Compare to previous records file
+  parser.add_argument('--compare-to', type=str, default=None,
+                      help='Compare the current records to a previous records JSON file and highlight risky differences.')
+
   global args
   args = parser.parse_args()
 
@@ -75,6 +78,40 @@ def parseOptions():
   print(f"Debug: {args.debug}")
   print(f"Score: {args.score}")
   print(f"Input file: {args.input}")
+
+def compare_records(current_records, previous_records):
+  risky_diffs = []
+  for record in current_records:
+    # Skip records with underscores as they are always safe
+    if '_' in record:
+      continue
+    if record in previous_records:
+      prev_score = previous_records[record].get('Score', 0)
+      curr_score = current_records[record].get('Score', 0)
+      # Highlight if a record has become unsafe or dropped significantly
+      if prev_score > 10 and curr_score <= 10:
+        risky_diffs.append((record, prev_score, curr_score, 'Became unsafe'))
+      elif curr_score < prev_score and curr_score <= 10:
+        risky_diffs.append((record, prev_score, curr_score, 'Score dropped to risky'))
+    else:
+      # New record, could be risky if score is low
+      curr_score = current_records[record].get('Score', 0)
+      if curr_score <= 10:
+        risky_diffs.append((record, None, curr_score, 'New risky record'))
+  for record in previous_records:
+    # Skip records with underscores as they are always safe
+    if '_' in record:
+      continue
+    if record not in current_records:
+      prev_score = previous_records[record].get('Score', 0)
+      if prev_score > 10:
+        risky_diffs.append((record, prev_score, None, 'Record missing (was safe)'))
+  if risky_diffs:
+    print('\nRISKY DIFFERENCES FOUND:')
+    for rec, prev, curr, reason in risky_diffs:
+      print(f"- {rec}: {reason} (Previous: {prev}, Current: {curr})")
+  else:
+    print('\nNo risky differences found between current and previous records.')
 
 def loadSafeDomains():
   # Load safedomains from safedomains.txt
@@ -524,10 +561,19 @@ filename = f"records_{date}.json"
 with open(filename, 'w') as f:
   json.dump(records, f, indent=2)
 
+# If compare-to option is set, load previous records and compare (after summary/stats output)
+if hasattr(args, 'compare_to') and args.compare_to:
+    try:
+        with open(args.compare_to, 'r') as f:
+            previous_records = json.load(f)
+        compare_records(records, previous_records)
+    except Exception as e:
+        print(f"Error comparing to previous records: {e}")
+
 # Output results
 pprint(summary)
+
 stats['finish_time'] = time.time()
 stats['total_time'] = stats['finish_time'] - stats['start_time']
 stats['total_requests'] = stats['http_requests'] + stats['https_requests']
 pprint(stats)
-
