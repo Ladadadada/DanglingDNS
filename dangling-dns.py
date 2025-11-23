@@ -1,12 +1,15 @@
 #!/usr/local/bin/python3
 
+# HTTP requests
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urlparse
+
+# DNS stuff
 import socket
 import re
-
+import dns.resolver
 
 import json
 from pprint import pprint
@@ -224,6 +227,14 @@ def retrySession(retries, session=None, backoff_factor=0.3):
   session.mount('https://', adapter)
   return session
 
+def query_ns(nameserver, hostname, record_type):
+  resolver = dns.resolver.Resolver()
+  log(f"Querying NS {nameserver} for {hostname} {record_type}", "debug")
+  resolver.nameservers = [nameserver]
+
+  return resolver.resolve(qname = hostname, rdtype = record_type)
+
+
 def get_ipv4_by_hostname(hostname):
 
   if('ips' in records[hostname]):
@@ -359,57 +370,88 @@ def check_tls_status(record, url, response, errors, changed):
 def handle_ns_record(record):
   # Check NS records for dangling potential by verifying if the NS nameserver is valid
   if('ResourceRecords' in records[record] and len(records[record]['ResourceRecords']) > 0):
-      for ns_record in records[record]['ResourceRecords']:
-        # Strip off trailing dot from nameserver
-        ns_value = ns_record['Value']
-        if ns_value.endswith('.'):
-          ns_value = ns_value[:-1]
-        print(f"Checking NS record for {record} pointing to nameserver {ns_value}")
-        log(json.dumps(records[record], indent=2), "debug")
+    for ns_record in records[record]['ResourceRecords']:
+      # Check score threshold to end early if already conclusive
+      if records[record]['Score'] > 99 or records[record]['Score'] < -99:
+        log(f"NS record score for {record} is already conclusive ({records[record]['Score']}), stopping early", "debug")
+        return 0
 
-        # Try to resolve the NS nameserver
-        # The regular get_ipv4_by_hostname() makes assumptions that don't work well here.
-        # NS records point at other records, like a CNAME, but don't directly resolve if you ask a resolver for them.
-        # We're not expecting IP addresses back when we ask for the NS records.
-        # Each record needs to have its own score and resolved IPs.
-        # The targets of the NS records do resolve to an IP, but they aren't "ours".
-        # There's also no sense in treating them like HTTP servers.
-        # If any of them fail to resolve they that record is dangling.
-        # If all NS records get good scores, adjust the score for the parent record.
-        stats['dns_lookups'] += 1
-        ips = []
-        try:
-          for i in socket.getaddrinfo(ns_value, 0):
-            if( i[0] is socket.AddressFamily.AF_INET and (i[1] is socket.SocketKind.SOCK_STREAM) or i[1] is socket.SocketKind.SOCK_DGRAM):
-              if(i[4][0] not in ips):
-                  ips.append(i[4][0])
-              if ns_value not in records[record]:
-                records[record][ns_value] = {}
-              records[record][ns_value]['ips'] = sorted(ips)
-            else:
-              # What's the situation here? What causes this branch?
-              print(f"Unknown situation found for {ns_value}: {i}", "debug")
-              print(json.dumps(ns_record, indent=2), "debug")
-        except Exception as e:
-          if(e is socket.gaierror):
-            log(f"DNS failed to resolve for {ns_value}.", "debug")
-            records[record][i]['Score'] = sorted(ips)
+      # Strip off trailing dot from nameserver
+      ns_value = ns_record['Value']
+      if ns_value.endswith('.'):
+        ns_value = ns_value[:-1]
+      log(f"Checking NS record for {record} pointing to nameserver {ns_value}", "debug")
+
+      # Three ways NS records can be dangling:
+      # 1. They point to a record that points to an IP address that can be taken over
+      #   - How can we test this? If it times out then it might be unowned?
+      # 2. They point to a nameserver that can be taken over (for instance at AWS if no matching hosted zone exists)
+      #.  - At AWS, if we query the nameserver for the domain and it responds FORBIDDEN or similar, it is vulnerable.
+      # 3. They point to domain that can be taken over (for instance a domain that isn't registered)
+      #   - If the top level of the target domain is not registered, it's vulnerable, although exploiting it requires spending money
+      #  
+      # Try to resolve the nameserver
+      # The regular get_ipv4_by_hostname() makes assumptions that don't work well here.
+      # NS records point at other records, like a CNAME, but don't directly resolve if you ask a resolver for them.
+      # We're not expecting IP addresses back when we ask for the NS records.
+      # Each record needs to have its own score and resolved IPs.
+      # The targets of the NS records do resolve to an IP, but they aren't "ours".
+      # There's also no sense in treating them like HTTP servers.
+      # If any of them fail to resolve they that record is dangling.
+      # If all NS records get good scores, adjust the score for the parent record.
+      stats['dns_lookups'] += 1
+      ips = []
+      try:
+        for i in socket.getaddrinfo(ns_value, 0):
+          if( i[0] is socket.AddressFamily.AF_INET and (i[1] is socket.SocketKind.SOCK_STREAM) or i[1] is socket.SocketKind.SOCK_DGRAM):
+            if(i[4][0] not in ips):
+              ips.append(i[4][0])
+            if ns_value not in records[record]:
+              records[record][ns_value] = {}
+            records[record][ns_value]['ips'] = sorted(ips)
           else:
-            log(f"DNS failed to resolve for {ns_value} {e}.", "debug")
-
-        if ips:
-            # AWS Nameservers will always resolve
-            # but when you query them for the domain they will respond FORBIDDEN or something if there isn't a matching hosted zone
-            # We also need to check that we own the hosted zone, because resolving IPs is what a malicious attacker does when they have captured a dangling NS record
-            log(f"NS record {record} points to valid nameserver {ns_value} {ips}", "debug")
-            adjust_ns_score(record, ns_value, 50, "NS points to valid nameserver")
+            # What's the situation here? What causes this branch?
+            # One time it was a different kind of socket.
+            log(f"Unknown situation found for {ns_value}: {i}", "debug")
+            log(json.dumps(ns_record, indent=2), "debug")
+      except Exception as e:
+        if(e is socket.gaierror):
+          log(f"DNS failed to resolve for {ns_value}.", "debug")
+          records[record][i]['Score'] = sorted(ips)
         else:
-            # If the NS records don't resolve, it's dangling
-            log(f"NS record {record} points to unresolvable nameserver {ns_value}", "debug")
-            adjust_ns_score(record, ns_value, -100, "NS points to unresolvable nameserver")
+          log(f"DNS failed to resolve for {ns_value} {e}.", "debug")
 
-        print(f"Finished checking NS record: {record} -> {ns_value}")
-        print(json.dumps(records[record], indent=2))
+      # Checking case 2.
+      if ips:
+        # AWS Nameservers will always resolve
+        # but when you query them for the domain they will respond FORBIDDEN or something if there isn't a matching hosted zone
+        # We also need to check that we own the hosted zone, because resolving IPs is what a malicious attacker does when they have captured a dangling NS record
+        # We can query for SOA or NS records for the domain, or maybe an A record for the apex.
+        # If the SOA or NS records resolve the zone exists so it's either not dangling or compromised.
+        # If the apex resolves and is a safeip, it could still be compromised, but they're pointing at our safeips so... shrug?
+        log(f"NS record {record} points to valid nameserver {ns_value} {ips}", "debug")
+        adjust_ns_score(record, ns_value, 50, "NS points to valid nameserver")
+        try:
+          query_ns(ips[0], record, 'SOA')
+        except Exception as e:
+          adjust_ns_score(record, ns_value, -100, "Nameserver does not resolve SOA record for domain")
+          log(f"Failed to query NS {ips[0]} for {record} SOA record: {e}", "debug")
+      else:
+        # If the NS records don't resolve, it's dangling
+        log(f"NS record {record} points to unresolvable nameserver {ns_value}", "debug")
+        adjust_ns_score(record, ns_value, -100, "NS points to unresolvable nameserver")
+
+      log(f"Finished checking NS record: {record} -> {ns_value}", "debug")
+    # After checking all NS records, pick the lowest score for the record
+    lowest_ns_score = 0
+    for ns_record in records[record]['ResourceRecords']:
+      # Strip off trailing dot from nameserver
+      ns_value = ns_record['Value']
+      if ns_value.endswith('.'):
+        ns_value = ns_value[:-1]
+      lowest_ns_score += records[record][ns_value]['Score']
+      log(f"Change overall NS record score for {record} by {lowest_ns_score}", "debug")
+      adjust_score(record, lowest_ns_score, "Aggregated NS record scores")
   return 0
 
 def handle_a_cname_record(record):
@@ -501,7 +543,7 @@ def adjust_score(record, score_change, reason = "Unknown"):
     records[record]['causes'] = [reason]
   # If this score change pushes the record over a threshold (+100 or -100) then cascade changes to related domains and IPs
   if(records[record]['Score'] > 99):
-    log(f"Score change for {record} means it is now safe: {records[record]['Score']}", "debug")
+    log(f"Score change for {record} means it is now safe: {records[record]['Score']}. {reason}", "debug")
     # Add domain and CNAME or Alias target to safedomains
     if(record not in safedomains):
       safedomains.append(record)
@@ -515,11 +557,13 @@ def adjust_score(record, score_change, reason = "Unknown"):
       log(f"Score change for {record} means Alias target {records[record]['AliasTarget']['DNSName']} is now safe", "debug")
       safedomains.append(records[record]['AliasTarget']['DNSName'])
   elif(records[record]['Score'] < -99):
-    log(f"Score change for {record} means it is now unsafe: {records[record]['Score']}", "debug")
+    log(f"Score change for {record} means it is now unsafe: {records[record]['Score']}. {reason}", "debug")
   else:
     log(f"Score change for {record} leaves it still in the middle: {records[record]['Score']}", "info")
 
 def adjust_ns_score(record, nameserver, score_change, reason = "Unknown"):
+  if nameserver not in records[record]:
+    records[record][nameserver] = {}
   if 'Score' not in records[record][nameserver]:
     records[record][nameserver]['Score'] = 0
   records[record][nameserver]['Score'] += score_change
@@ -601,7 +645,7 @@ loadDNSRecords()
 changed = 1
 while changed > 0:
     changed = 0
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_record, record): record for record in records}
         for future in as_completed(futures):
             result = future.result()
