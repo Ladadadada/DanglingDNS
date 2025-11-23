@@ -191,7 +191,7 @@ def loadDNSRecords():
   f = open(args.input)
   loadedrecords = json.load(f)
   for record in loadedrecords:
-    if(record['Type'] == 'A' or record['Type'] == 'CNAME'):
+    if(record['Type'] == 'A' or record['Type'] == 'CNAME' or record['Type'] == 'NS'):
       # Strip off trailing dots as we go.
       if(record['Name'][-1] == '.'):
         record['Name'] = record['Name'][:-1]
@@ -199,13 +199,13 @@ def loadDNSRecords():
         record['ResourceRecords'] = sorted(record['ResourceRecords'], key=lambda d: d['Value']) # Sort these so that we can compare them day to day.
       records[record['Name']] = record
       records[record['Name']]['Score'] = 0
+
   del loadedrecords
   f.close()
   log(f"Finished loading records.", "debug")
 
 def log(message, level):
-  debug=False
-  if(debug == False and level == "debug"):
+  if(args.debug == False and level == "debug"):
     pass
   else:
     print(f"{datetime.now()} {message}")
@@ -225,6 +225,7 @@ def retrySession(retries, session=None, backoff_factor=0.3):
   return session
 
 def get_ipv4_by_hostname(hostname):
+
   if('ips' in records[hostname]):
     stats['dns_cached'] += 1
     return records[hostname]['ips']
@@ -281,8 +282,6 @@ def getHttp(url):
           timeoutIPs.append(ip)
       log(f"Slow response from {url}: {time.time() - start_time}. Adding {ips} to timeoutIPs", "tmpdebug")
     return None, e
-
-
 
 def follow_redirects(record, response, url):
     changed = 0
@@ -357,6 +356,143 @@ def check_tls_status(record, url, response, errors, changed):
       response, errors = getHttp(url)
   return response, errors, changed
 
+def handle_ns_record(record):
+  # Check NS records for dangling potential by verifying if the NS nameserver is valid
+  if('ResourceRecords' in records[record] and len(records[record]['ResourceRecords']) > 0):
+      for ns_record in records[record]['ResourceRecords']:
+        # Strip off trailing dot from nameserver
+        ns_value = ns_record['Value']
+        if ns_value.endswith('.'):
+          ns_value = ns_value[:-1]
+        print(f"Checking NS record for {record} pointing to nameserver {ns_value}")
+        log(json.dumps(records[record], indent=2), "debug")
+
+        # Try to resolve the NS nameserver
+        # The regular get_ipv4_by_hostname() makes assumptions that don't work well here.
+        # NS records point at other records, like a CNAME, but don't directly resolve if you ask a resolver for them.
+        # We're not expecting IP addresses back when we ask for the NS records.
+        # Each record needs to have its own score and resolved IPs.
+        # The targets of the NS records do resolve to an IP, but they aren't "ours".
+        # There's also no sense in treating them like HTTP servers.
+        # If any of them fail to resolve they that record is dangling.
+        # If all NS records get good scores, adjust the score for the parent record.
+        stats['dns_lookups'] += 1
+        ips = []
+        try:
+          for i in socket.getaddrinfo(ns_value, 0):
+            if( i[0] is socket.AddressFamily.AF_INET and (i[1] is socket.SocketKind.SOCK_STREAM) or i[1] is socket.SocketKind.SOCK_DGRAM):
+              if(i[4][0] not in ips):
+                  ips.append(i[4][0])
+              if ns_value not in records[record]:
+                records[record][ns_value] = {}
+              records[record][ns_value]['ips'] = sorted(ips)
+            else:
+              # What's the situation here? What causes this branch?
+              print(f"Unknown situation found for {ns_value}: {i}", "debug")
+              print(json.dumps(ns_record, indent=2), "debug")
+        except Exception as e:
+          if(e is socket.gaierror):
+            log(f"DNS failed to resolve for {ns_value}.", "debug")
+            records[record][i]['Score'] = sorted(ips)
+          else:
+            log(f"DNS failed to resolve for {ns_value} {e}.", "debug")
+
+        if ips:
+            # AWS Nameservers will always resolve
+            # but when you query them for the domain they will respond FORBIDDEN or something if there isn't a matching hosted zone
+            # We also need to check that we own the hosted zone, because resolving IPs is what a malicious attacker does when they have captured a dangling NS record
+            log(f"NS record {record} points to valid nameserver {ns_value} {ips}", "debug")
+            adjust_ns_score(record, ns_value, 50, "NS points to valid nameserver")
+        else:
+            # If the NS records don't resolve, it's dangling
+            log(f"NS record {record} points to unresolvable nameserver {ns_value}", "debug")
+            adjust_ns_score(record, ns_value, -100, "NS points to unresolvable nameserver")
+
+        print(f"Finished checking NS record: {record} -> {ns_value}")
+        print(json.dumps(records[record], indent=2))
+  return 0
+
+def handle_a_cname_record(record):
+  log(f"Handling A or CNAME record: {record}", "debug")
+  ips = get_ipv4_by_hostname(record)
+
+  if(records[record]['Score'] > 99 and record in safedomains):
+    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
+    return 0
+
+  elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
+    log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
+    return 0
+
+  elif(records[record]['Score'] > 99 and not record in safedomains):
+    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
+    safedomains.append(record)
+    return 1
+
+  elif(not ips):
+    log(f"DNS Lookup failure: {record} {ips}", "debug")
+    adjust_score(record, -100, "DNS lookup failure")
+    return 0
+
+  elif(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
+    and ( records[record]['ResourceRecords'][0]['Value'][:3] == '10.' or records[record]['ResourceRecords'][0]['Value'][:8] == '192.168.')):
+    log(f"Private range safe: ({record} -> {records[record]['ResourceRecords'][0]['Value']}) ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "Private range")
+    return 1
+
+  elif(records[record]["Type"] == "CNAME"
+    and records[record]['ResourceRecords'][0]['Value'] in safedomains):
+    log(f"Raising score for CNAME pointing to {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "CNAME points to safedomain")
+    return 1
+
+  elif(records[record]["Type"] == "A"
+    and 'AliasTarget' in records[record]
+    and records[record]['AliasTarget']['DNSName'] in safedomains):
+    log(f"Raising score for Alias pointing to {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "Alias points to safedomain")
+    return 1
+
+  elif(records[record]["Type"] == "CNAME"
+    and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
+    log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "CNAME points to high entropy ELB domain")
+    return 1
+
+  elif(records[record]["Type"] == "A"
+    and 'AliasTarget' in records[record]
+    and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
+    log(f"Raising score for Alias pointing to high entropy domain {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "Alias points to high entropy domain")
+    if(records[record]['AliasTarget']['DNSName'][:-1] not in safedomains):
+        safedomains.append(records[record]['AliasTarget']['DNSName'][:-1])
+    return 1
+
+  elif(records[record]["Type"] == "CNAME"
+    and re.findall(r'.*\.s3-website-eu-west-1.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
+    log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    adjust_score(record, 100, "CNAME points to high entropy S3 domain")
+    return 1
+
+  elif(records[record]["Type"] == "A"
+    and 'AliasTarget' in records[record]
+    and re.findall('s3-website-eu-west-1.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
+    log(f"Lowering score for Alias pointing to generic S3 endpoint {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25})", "tmpdebug")
+    adjust_score(record, -25, "Alias points to S3 endpoint")
+    return 1
+
+  elif(record in timeoutDomains):
+    log(f"Domain is known to time out, not requesting again: {record}", "tmpdebug")
+    return 0
+
+  elif(len(ips) > 0 and ips[0] in timeoutIPs):
+      log(f"IP is known to time out, not requesting again: {record} {get_ipv4_by_hostname(record)[0]}", "tmpdebug")
+      return 0
+
+  else:
+        return analyse_http(record)
+
+
 def adjust_score(record, score_change, reason = "Unknown"):
   records[record]['Score'] += score_change
   if 'causes' in records[record]:
@@ -383,24 +519,18 @@ def adjust_score(record, score_change, reason = "Unknown"):
   else:
     log(f"Score change for {record} leaves it still in the middle: {records[record]['Score']}", "info")
 
-############################## Main ########################
+def adjust_ns_score(record, nameserver, score_change, reason = "Unknown"):
+  if 'Score' not in records[record][nameserver]:
+    records[record][nameserver]['Score'] = 0
+  records[record][nameserver]['Score'] += score_change
+  if 'causes' in records[record]:
+    records[record][nameserver]['causes'].append(reason)
+  else:
+    records[record][nameserver]['causes'] = [reason]
 
-parseOptions()
-loadSafeDomains()
-loadSafeIPs()
-loadSafeStrings()
-loadSeedURLs()
-loadDNSRecords()
+  # Check all nameservers in this record to see if they are safe or unsafe
 
-# Main loop
-# filter out everything we can without network requests
-# Some of these can be taken over if they are dangling but we don't support them yet
-# I have seen NS record takeovers in the wild and MX records are theoretically possible
-
-# Threaded main loop
-changed = 1
 def process_record(record):
-    # ...existing code from the main loop for a single record...
     if('_' in record):
         adjust_score(record, 100, "Record with underscore")
         log(f"Ignoring records with underscores ({record})", "debug")
@@ -408,94 +538,20 @@ def process_record(record):
 
     if(records[record]['Type'] == 'SOA'
       or records[record]['Type'] == 'TXT'
-      or records[record]['Type'] == 'NS'
       or records[record]['Type'] == 'MX'
       or records[record]['Type'] == 'PTR'):
         log(f"Ignoring {records[record]['Type']} records ({records[record]['Name']})", "debug")
         return 0
 
-    ips = get_ipv4_by_hostname(record)
+    elif(records[record]['Type'] == 'A' or records[record]['Type'] == 'CNAME'):
+        return handle_a_cname_record(record)
 
-    if(records[record]['Score'] > 99 and record in safedomains):
-        log(f"Already safe: {records[record]['Score']} ({record})", "debug")
-        return 0
+    elif(records[record]['Type'] == 'NS'):
+        return handle_ns_record(record)
 
-    elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
-        log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
-        return 0
-
-    elif(records[record]['Score'] > 99 and not record in safedomains):
-        log(f"Already safe: {records[record]['Score']} ({record})", "debug")
-        safedomains.append(record)
-        return 1
-
-    elif(not ips):
-        log(f"DNS Lookup failure: {record} {ips}", "debug")
-        adjust_score(record, -100, "DNS lookup failure")
-        return 0
-
-    elif(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
-      and ( records[record]['ResourceRecords'][0]['Value'][:3] == '10.' or records[record]['ResourceRecords'][0]['Value'][:8] == '192.168.')):
-        log(f"Private range safe: ({record} -> {records[record]['ResourceRecords'][0]['Value']}) ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "Private range")
-        return 1
-
-    elif(records[record]["Type"] == "CNAME"
-      and records[record]['ResourceRecords'][0]['Value'] in safedomains):
-        log(f"Raising score for CNAME pointing to {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "CNAME points to safedomain")
-        return 1
-
-    elif(records[record]["Type"] == "A"
-      and 'AliasTarget' in records[record]
-      and records[record]['AliasTarget']['DNSName'] in safedomains):
-        log(f"Raising score for Alias pointing to {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "Alias points to safedomain")
-        return 1
-
-    elif(records[record]["Type"] == "CNAME"
-      and re.findall('.*\d*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
-        log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "CNAME points to high entropy ELB domain")
-        return 1
-
-    elif(records[record]["Type"] == "A"
-      and 'AliasTarget' in records[record]
-      and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
-        log(f"Raising score for Alias pointing to high entropy domain {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "Alias points to high entropy domain")
-        if(records[record]['AliasTarget']['DNSName'][:-1] not in safedomains):
-            safedomains.append(records[record]['AliasTarget']['DNSName'][:-1])
-        return 1
-
-    elif(records[record]["Type"] == "CNAME"
-      and re.findall(r'.*\.s3-website-eu-west-1.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
-        log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
-        adjust_score(record, 100, "CNAME points to high entropy S3 domain")
-        return 1
-
-    elif(records[record]["Type"] == "A"
-      and 'AliasTarget' in records[record]
-      and re.findall('s3-website-eu-west-1.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
-        log(f"Lowering score for Alias pointing to generic S3 endpoint {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25})", "tmpdebug")
-        adjust_score(record, -25, "Alias points to S3 endpoint")
-        return 1
-
-    elif(records[record]['Type'] != 'A'
-      and records[record]['Type'] != 'CNAME'):
+    elif(records[record]['Type'] not in ['A', 'CNAME', 'NS']):
         log(f"Not handled record type: {records[record]['Type']} {record}", "debugn")
         return 0
-
-    elif(record in timeoutDomains):
-        log(f"Domain is known to time out, not requesting again: {record}", "tmpdebug")
-        return 0
-
-    elif(len(ips) > 0 and ips[0] in timeoutIPs):
-        log(f"IP is known to time out, not requesting again: {record} {get_ipv4_by_hostname(record)[0]}", "tmpdebug")
-        return 0
-
-    else:
-          return analyse_http(record)
 
 def analyse_http(record):
     if record in seedurls:
@@ -528,6 +584,21 @@ def analyse_http(record):
         log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "tmpdebug")
     return changed
 
+############################## Main ########################
+
+parseOptions()
+loadSafeDomains()
+loadSafeIPs()
+loadSafeStrings()
+loadSeedURLs()
+loadDNSRecords()
+
+# Main loop
+# filter out everything we can without network requests
+# Some of these can be taken over if they are dangling but we don't support them yet
+# MX records are theoretically possible
+
+changed = 1
 while changed > 0:
     changed = 0
     with ThreadPoolExecutor() as executor:
@@ -539,20 +610,7 @@ while changed > 0:
     log(f"Changed {changed} scores during this loop.", "tmpdebug")
     log(f"safedomains now contains {len(safedomains)} domains.", "tmpdebug")
 
-# End main loop
-
-summary = {'safe': 0, 'unsafe': 0, 'unknown': 0}
-# Calculate results
-for record in records:
-  if(records[record]['Score'] <= 10):
-    summary['unsafe'] = summary['unsafe'] + 1
-    log(f"{record}: {records[record]['Score']}", "info")
-  elif(records[record]['Score'] <= args.score):
-    summary['unknown'] = summary['unknown'] + 1
-    log(f"{record}: {records[record]['Score']}", "info")
-  else:
-    summary['safe'] = summary['safe'] + 1
-    #log(f"{record}: {records[record]['Score']}", "info")
+# End main loop, report results and finish up
 
 # Save records with scores to file
 now = datetime.now() # current date and time
@@ -570,10 +628,23 @@ if hasattr(args, 'compare_to') and args.compare_to:
     except Exception as e:
         print(f"Error comparing to previous records: {e}")
 
+summary = {'safe': 0, 'unsafe': 0, 'unknown': 0}
+# Calculate results
+for record in records:
+  if(records[record]['Score'] <= 10):
+    summary['unsafe'] = summary['unsafe'] + 1
+    log(f"{record}: {records[record]['Score']}", "info")
+  elif(records[record]['Score'] <= args.score):
+    summary['unknown'] = summary['unknown'] + 1
+    log(f"{record}: {records[record]['Score']}", "info")
+  else:
+    summary['safe'] = summary['safe'] + 1
+    #log(f"{record}: {records[record]['Score']}", "info")
+
 # Output results
-pprint(summary)
+print(json.dumps(summary, indent=2))
 
 stats['finish_time'] = time.time()
 stats['total_time'] = stats['finish_time'] - stats['start_time']
 stats['total_requests'] = stats['http_requests'] + stats['https_requests']
-pprint(stats)
+print(json.dumps(stats, indent=2))
