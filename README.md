@@ -32,6 +32,10 @@ If you run it daily and save the output, you can compare it to the previous day'
 DanglingDNS works by making HTTP requests to your DNS records and looking for clues in the responses (or lack of response) that the IP address it points to is controlled by you. Clues can be either positive (more likely that you control the IP) or negative (less likely that you own the IP). The positive clues are based on information that you put into the "safe" configuration files. For instance, if you use Google Analytics on your sites then the HTTP responses will contain your Google Analytics ID. The same works for your Facebook and Twitter IDs if you have social media buttons on your website.
 If you own a range of IP addresses you can put those into the safeips file.
 
+DNS records can be provided in two ways:
+1. **Local JSON file** (default): Use the `-i` or `--input` option to specify a JSON file containing DNS records.
+2. **AWS Route53** (new): Use the `--aws-route53` flag to fetch records directly from your AWS Route53 hosted zones. You can specify which AWS profile and region to use with `--aws-profile` and `--aws-region` options.
+
 These HTTP requests can take a long time to complete, especially for domains that point to an IP address without any website running on it currently. To speed up the scan, we keep track of all the IPs and domains we have determined are safe and skip making HTTP requests for any DNS record that point to something we have already determined is safe. A future improvement will be to add threading to run the requests in parallel.
 
 Any positive signal improves the score of the DNS record and the IP(s) it points to, including a chain of CNAME records that eventually point to the IP(s). When the score is high enough, all the records and IPs are considered "safe".

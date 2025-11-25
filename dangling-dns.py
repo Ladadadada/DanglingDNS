@@ -11,6 +11,10 @@ import socket
 import re
 import dns.resolver
 
+# AWS
+import boto3
+
+
 import json
 from pprint import pprint
 import os
@@ -74,13 +78,25 @@ def parseOptions():
   parser.add_argument('--compare-to', type=str, default=None,
                       help='Compare the current records to a previous records JSON file and highlight risky differences.')
 
+  # AWS Route53 integration
+  parser.add_argument('--aws-route53', action='store_true',
+                      help='Fetch DNS records from AWS Route53 instead of using a local file.')
+  parser.add_argument('--aws-profile', type=str, default=None,
+                      help='AWS profile name to use for Route53 access.')
+  parser.add_argument('--aws-region', type=str, default='us-east-1',
+                      help='AWS region to use. Default: us-east-1')
+
   global args
   args = parser.parse_args()
 
   print("Parsed args:")
   print(f"Debug: {args.debug}")
   print(f"Score: {args.score}")
-  print(f"Input file: {args.input}")
+  if args.aws_route53:
+    print(f"AWS Route53 mode enabled")
+    print(f"AWS Profile: {args.aws_profile if args.aws_profile else 'default'}")
+  else:
+    print(f"Input file: {args.input}")
 
 def compare_records(current_records, previous_records):
   risky_diffs = []
@@ -93,14 +109,17 @@ def compare_records(current_records, previous_records):
       curr_score = current_records[record].get('Score', 0)
       # Highlight if a record has become unsafe or dropped significantly
       if prev_score > 10 and curr_score <= 10:
-        risky_diffs.append((record, prev_score, curr_score, 'Became unsafe'))
+        causes = current_records[record].get('causes', [])
+        risky_diffs.append((record, prev_score, curr_score, 'Became unsafe', causes))
       elif curr_score < prev_score and curr_score <= 10:
-        risky_diffs.append((record, prev_score, curr_score, 'Score dropped to risky'))
+        causes = current_records[record].get('causes', [])
+        risky_diffs.append((record, prev_score, curr_score, 'Score dropped to risky', causes))
     else:
       # New record, could be risky if score is low
       curr_score = current_records[record].get('Score', 0)
       if curr_score <= 10:
-        risky_diffs.append((record, None, curr_score, 'New risky record'))
+        causes = current_records[record].get('causes', [])
+        risky_diffs.append((record, None, curr_score, 'New risky record', causes))
   for record in previous_records:
     # Skip records with underscores as they are always safe
     if '_' in record:
@@ -108,11 +127,12 @@ def compare_records(current_records, previous_records):
     if record not in current_records:
       prev_score = previous_records[record].get('Score', 0)
       if prev_score > 10:
-        risky_diffs.append((record, prev_score, None, 'Record missing (was safe)'))
+        risky_diffs.append((record, prev_score, None, 'Record missing (was safe)', []))
   if risky_diffs:
-    print('\nRISKY DIFFERENCES FOUND:')
-    for rec, prev, curr, reason in risky_diffs:
-      print(f"- {rec}: {reason} (Previous: {prev}, Current: {curr})")
+    print('== DIFFERENCES FOUND: ==')
+    for rec, prev, curr, reason, causes in risky_diffs:
+      causes_str = ', '.join(causes) if causes else 'Unknown'
+      print(f"- {rec}: {reason} (Previous: {prev}, Current: {curr}) Reasons: {causes_str}")
   else:
     print('\nNo risky differences found between current and previous records.')
 
@@ -189,8 +209,44 @@ def loadSeedURLs():
     else:
       print(f"Not adding anything from {origLine} to seedurls")
 
+def loadDNSRecordsFromAWS():
+  log(f"Loading DNS records from AWS Route53.", "debug")
+  try:
+    session = boto3.Session(profile_name=args.aws_profile, region_name=args.aws_region)
+    route53 = session.client('route53')
+
+    # List all hosted zones
+    paginator = route53.get_paginator('list_hosted_zones')
+    for page in paginator.paginate():
+      for zone in page['HostedZones']:
+        zone_id = zone['Id']
+        zone_name = zone['Name'].rstrip('.')
+        log(f"Processing hosted zone: {zone_name}", "debug")
+
+        # List all records in this zone
+        record_paginator = route53.get_paginator('list_resource_record_sets')
+        for record_page in record_paginator.paginate(HostedZoneId=zone_id):
+          for record_set in record_page['ResourceRecordSets']:
+            if record_set['Type'] in ['A', 'CNAME', 'NS']:
+              record_name = record_set['Name'].rstrip('.')
+              resource_records = [{'Value': rr['Value']} for rr in record_set.get('ResourceRecords', [])]
+              records[record_name] = {
+                'Name': record_name,
+                'Type': record_set['Type'],
+                'ResourceRecords': sorted(resource_records, key=lambda d: d['Value']),
+                'Score': 0
+              }
+    log(f"Finished loading {len(records)} records from AWS Route53.", "debug")
+    return True
+  except Exception as e:
+    print(f"Error loading records from AWS Route53: {e}")
+    return False
+
 def loadDNSRecords():
-  log(f"Loading DNS records.", "debug")
+  if args.aws_route53:
+    return loadDNSRecordsFromAWS()
+
+  log(f"Loading DNS records from file.", "debug")
   f = open(args.input)
   loadedrecords = json.load(f)
   for record in loadedrecords:
@@ -205,7 +261,8 @@ def loadDNSRecords():
 
   del loadedrecords
   f.close()
-  log(f"Finished loading records.", "debug")
+  log(f"Finished loading records from file.", "debug")
+  return True
 
 def log(message, level):
   if(args.debug == False and level == "debug"):
@@ -389,7 +446,7 @@ def handle_ns_record(record):
       #.  - At AWS, if we query the nameserver for the domain and it responds FORBIDDEN or similar, it is vulnerable.
       # 3. They point to domain that can be taken over (for instance a domain that isn't registered)
       #   - If the top level of the target domain is not registered, it's vulnerable, although exploiting it requires spending money
-      #  
+      #
       # Try to resolve the nameserver
       # The regular get_ipv4_by_hostname() makes assumptions that don't work well here.
       # NS records point at other records, like a CNAME, but don't directly resolve if you ask a resolver for them.
@@ -474,6 +531,11 @@ def handle_a_cname_record(record):
   elif(not ips):
     log(f"DNS Lookup failure: {record} {ips}", "debug")
     adjust_score(record, -100, "DNS lookup failure")
+    return 0
+
+  elif(len(records[record]['ResourceRecords']) == 0):
+    log(f"No ResourceRecords found: {record}", "debug")
+    adjust_score(record, 100, f"No ResourceRecords found for {record}")
     return 0
 
   elif(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
@@ -663,15 +725,6 @@ filename = f"records_{date}.json"
 with open(filename, 'w') as f:
   json.dump(records, f, indent=2)
 
-# If compare-to option is set, load previous records and compare (after summary/stats output)
-if hasattr(args, 'compare_to') and args.compare_to:
-    try:
-        with open(args.compare_to, 'r') as f:
-            previous_records = json.load(f)
-        compare_records(records, previous_records)
-    except Exception as e:
-        print(f"Error comparing to previous records: {e}")
-
 summary = {'safe': 0, 'unsafe': 0, 'unknown': 0}
 # Calculate results
 for record in records:
@@ -687,6 +740,15 @@ for record in records:
 
 # Output results
 print(json.dumps(summary, indent=2))
+
+# If compare-to option is set, load previous records and compare (after summary/stats output)
+if hasattr(args, 'compare_to') and args.compare_to:
+    try:
+        with open(args.compare_to, 'r') as f:
+            previous_records = json.load(f)
+        compare_records(records, previous_records)
+    except Exception as e:
+        print(f"Error comparing to previous records: {e}")
 
 stats['finish_time'] = time.time()
 stats['total_time'] = stats['finish_time'] - stats['start_time']
