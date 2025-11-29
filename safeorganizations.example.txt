@@ -1,0 +1,9 @@
+# List of certificate organizations that indicate domain ownership
+# These should match the Organization (O) field in the certificate subject
+# One organization per line, comments start with #
+
+# Example organizations (replace with your actual company names):
+Example Inc.
+Example Corporation
+Example Ltd
+My Company Name

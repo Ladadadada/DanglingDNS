@@ -46,6 +46,7 @@ args = None
 safedomains = []
 safeips = []
 safestrings = []
+safeorganizations = []
 seedurls = {}
 
 records={}
@@ -190,6 +191,24 @@ def loadSafeStrings():
       print(f"Not adding \"{line}\" to safestrings")
   f.close()
 
+def loadSafeOrganizations():
+  # Load safeorganizations from safeorganizations.txt
+  f = open(f"safeorganizations.txt")
+  lines = f.readlines()
+  for line in lines:
+    # Remove comments
+    line = re.sub("#.*", "", line)
+    # Remove newlines
+    line = re.sub("\n", "", line)
+    # Remove trailing whitespace
+    line = re.sub(" *$", "", line)
+    # Remove leading whitespace
+    line = re.sub("^ *", "", line)
+    if line != "":
+      print(f"Adding \"{line}\" to safeorganizations")
+      safeorganizations.append(line)
+  f.close()
+
 def loadSeedURLs():
   # Some sites don't have anything identifiable on the homepage but do on other pages. This list helps us find them.
   f = open(f"seedurls.txt")
@@ -294,12 +313,18 @@ def query_ns(nameserver, hostname, record_type):
 
 def get_ipv4_by_hostname(hostname):
 
+  if(hostname not in records):
+    records[hostname] = {}
+    records[hostname]['Score'] = 0
+    log(f"Added new record for hostname {hostname}", "debug")
+
   if('ips' in records[hostname]):
     stats['dns_cached'] += 1
     return records[hostname]['ips']
 
   stats['dns_lookups'] += 1
   ips = []
+  log(f"Resolving DNS for {hostname}", "debug")
   try:
     for i in socket.getaddrinfo(hostname, 0):
       if( i[0] is socket.AddressFamily.AF_INET and i[1] is socket.SocketKind.SOCK_STREAM):
@@ -311,7 +336,9 @@ def get_ipv4_by_hostname(hostname):
       log(f"DNS failed to resolve for {hostname}.", "debug")
     else:
       log(f"DNS failed to resolve for {hostname} {e}.", "debug")
+    log(f"Adding IP list for {hostname} to {ips}", "debug")
     records[hostname]['ips'] = ips
+    records[hostname]['TYPE'] = 'A' # It could actually be a CNAME but I don't think it matters because it's not ours. To be added here it's a discovered record.
     return ips
 
 def getHttp(url):
@@ -393,11 +420,33 @@ def get_tls_names(domain):
     san_dns_names = []
   return san_dns_names
 
+def get_certificate_organization(domain):
+  try:
+    certificate: bytes = ssl.get_server_certificate((domain, 443)).encode('utf-8')
+    loaded_cert = x509.load_pem_x509_certificate(certificate, default_backend())
+    org_attrs = loaded_cert.subject.get_attributes_for_oid(x509.oid.NameOID.ORGANIZATION_NAME)
+    if org_attrs:
+      organization = org_attrs[0].value
+      log(f"Certificate organization for {domain}: {organization}", "debug")
+      return organization
+  except Exception as e:
+    log(f"Error getting certificate organization for {domain}: {e}", "debug")
+  return None
+
 def check_tls_status(record, url, response, errors, changed):
-  # If we got a valid HTTP response, raise score for correct SSL cert
+  # If we got a valid HTTP response, check certificate organization
   if response is not None and response.status_code > 100 and response.status_code < 600:
-    log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
-    adjust_score(record, 25, "Matching TLS cert")
+    org = get_certificate_organization(record)
+    log(f"Certificate organization for {record}: {org}", "debug")
+    if org and org in safeorganizations:
+      log(f"Raising score for response with correct EV SSL cert and matching organization: {record} ({records[record]['Score']} -> {records[record]['Score'] + 50}))", "tmpdebug")
+      adjust_score(record, 50, "Matching TLS cert with verified organization")
+    elif org and org not in safeorganizations:
+      log(f"Lowering score for response with foreign organization: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25}))", "tmpdebug")
+      adjust_score(record, -25, "Matching TLS cert but foreign organization")
+    else:
+      log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
+      adjust_score(record, 25, "Matching TLS cert")
 
   if response is None:
     if('Hostname mismatch' in str(errors) or 'SSLError' in str(errors)):
@@ -533,7 +582,7 @@ def handle_a_cname_record(record):
     adjust_score(record, -100, "DNS lookup failure")
     return 0
 
-  elif(len(records[record]['ResourceRecords']) == 0):
+  elif('ResourceRecords' not in records[record] or len(records[record]['ResourceRecords']) == 0):
     log(f"No ResourceRecords found: {record}", "debug")
     adjust_score(record, 100, f"No ResourceRecords found for {record}")
     return 0
@@ -696,6 +745,7 @@ parseOptions()
 loadSafeDomains()
 loadSafeIPs()
 loadSafeStrings()
+loadSafeOrganizations()
 loadSeedURLs()
 loadDNSRecords()
 

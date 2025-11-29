@@ -13,30 +13,37 @@ Dangling NS records can also be taken over. When this happens the attacker gains
 # Who is this tool for?
 It could potentially be used by anyone who owns or controls a domain and would provide different benefits in different ways to businesses of different sizes.
 
+### Small sized business
 At a startup you often only have one domain with a handful of subdomains. It's only a few minutes work to look through them manually and verify that they are all pointing at an IP address you control. But you probably only do this monthly at best and more likely yearly when your security audit comes around. DanglingDNS can be configured to run daily and alert you to any dangling DNS records as soon as they happen.
 
+### Medium sized business
 At a medium sized business the DNS landscape can be more complicated. You may have many domains and hundreds of DNS records built up over decades, managed by different areas of the business that all operate on their own schedule. Manually running through all your records centrally becomes a daunting task even on a yearly basis and the various teams don't necessarily have the security training, understanding or incentive to do the job themselves.
 
+### Large sized business
 At a large business where the number of DNS records is in the tens or hundreds of thousands nearly all of these will be created automatically by scripts or infrastructure as code and will be created and destroyed along with the resources they point to. You may also own your own IP address ranges and even data centres. Dangling DNS records will be an almost non-existant problem, however the stakes are much higher at this scale and if even a single record is taken over the number of users compromised could be in the millions. The more quickly you can detect and remove at-risk records the better. A daily scan of the entire estate or subsets of records is one way to reduce that risk.
 
-Security researchers, bug bounty hunters, red teams and penetration testers already have tools to guess what subdomains exist for a given domain but still face the same problem when trying to categorise them. DanglingDNS can help you rule out the records that are safe and concentrate on investigating the risky ones.
+### Security researchers
+Security researchers, bug bounty hunters, red teams and penetration testers already have tools to guess what subdomains exist for a given domain but still face the same problem as the business owners when trying to categorise the domains. DanglingDNS can help you rule out the records that are safe so you can concentrate on investigating the risky ones.
 
 # What does it do?
 Given a list of domains and some hints about the sorts of things you include on your websites, DanglingDNS will try to categorise each domain as either safe or at risk. This will help you narrow down the list to look at manually and present them to you in the priority order they should be looked at.
 
-Due to the nature of these things it is difficult for even humans to say with certainty that a record is dangling or not, and this tool is not as smart as a human. It definitely gets things wrong and you should not blindly trust the results of the tool and delete any domains it thinks are unsafe. But if you investigate the domains in the order it presents them you can maximise your impact while minimising your effort.
+Due to the nature of these things it is difficult for even humans to say with certainty that a record is dangling or not, and this tool is not as smart as a human. It definitely gets things wrong and you should not blindly trust the results of the tool. But if you investigate the domains in the order it presents them you can maximise your impact while minimising your effort.
 
-If you run it daily and save the output, you can compare it to the previous day's output to identify changes. This goes beyond just detecting changes in your DNS records or IP addresses but looks at the underlying web pages being returned on those domains. Assuming you have already manually verified all your domains, a change is worth investigating, especially one that moves a record from safe to unsafe.
+If you run it daily and save the output, you can compare it to the previous day's output to identify changes. This goes beyond just detecting changes in your DNS records or IP addresses but looks at the underlying web pages being returned on those domains. Assuming you have already manually verified all your domains, a change is worth investigating, especially one where a record changes from safe to unsafe.
 
 # How does it work?
-DanglingDNS works by making HTTP requests to your DNS records and looking for clues in the responses (or lack of response) that the IP address it points to is controlled by you. Clues can be either positive (more likely that you control the IP) or negative (less likely that you own the IP). The positive clues are based on information that you put into the "safe" configuration files. For instance, if you use Google Analytics on your sites then the HTTP responses will contain your Google Analytics ID. The same works for your Facebook and Twitter IDs if you have social media buttons on your website.
-If you own a range of IP addresses you can put those into the safeips file.
+DanglingDNS works by making HTTP requests and DNS queries to your domains, looking for clues in the responses (or lack of response) that the IP address it points to is controlled by you.
+
+Clues can be either positive (more likely that you control the IP) or negative (less likely that you own the IP). The positive clues are based on information that you put into the "safe" configuration files. For instance, if you use Google Analytics on your sites then the HTTP responses will contain your Google Analytics ID. The same works for your Facebook and Twitter IDs if you have social media buttons on your website.
+
+If you own a range of IP addresses you can tell DanglingDNS that anything pointing at these IPs is safe.
 
 DNS records can be provided in two ways:
 1. **Local JSON file** (default): Use the `-i` or `--input` option to specify a JSON file containing DNS records.
-2. **AWS Route53** (new): Use the `--aws-route53` flag to fetch records directly from your AWS Route53 hosted zones. You can specify which AWS profile and region to use with `--aws-profile` and `--aws-region` options.
+2. **AWS Route53** : Use the `--aws-route53` flag to fetch records directly from your AWS Route53 hosted zones. You can specify which AWS profile and region to use with `--aws-profile` and `--aws-region` options.
 
-These HTTP requests can take a long time to complete, especially for domains that point to an IP address without any website running on it currently. To speed up the scan, we keep track of all the IPs and domains we have determined are safe and skip making HTTP requests for any DNS record that point to something we have already determined is safe. A future improvement will be to add threading to run the requests in parallel.
+These HTTP requests can take a long time to complete, especially for domains that point to an IP address without any website running on it currently. To speed up the scan, we keep track of all the IPs and domains we have determined are safe and skip making HTTP requests for any DNS record that point to something we have already determined is safe.
 
 Any positive signal improves the score of the DNS record and the IP(s) it points to, including a chain of CNAME records that eventually point to the IP(s). When the score is high enough, all the records and IPs are considered "safe".
 
