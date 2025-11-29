@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added known hosting provider IP detection. When an A record resolves, the code checks if the IP belongs to a known hosting provider (AWS, Azure, GCP, etc.) configured in `safehostingproviders.txt`. IPs matching known providers are awarded +5 points, as this is a weak signal.
+Not being on a known hosting provider is a fairly strong negative signal.
+Pre-populated example file includes common providers.
 - Added certificate organization field verification. When an HTTPS response is received, the code now extracts the Organization field from the SSL certificate and checks it against a list of safe organizations in `safeorganizations.txt`. This prevents dangling domains with attacker-controlled certificates from getting false positive scores (+50 for verified org, -25 for foreign org).
 - Added Content-Security-Policy (CSP) header inspection. When an HTTP response is received, the code now checks if the CSP header contains any of your `safedomains`. Finding a safedomain in CSP is a strong indicator of legitimate infrastructure (+50 points per domain found).
 - Added threading to evaluate each record in parallel. Cuts run time by around 90%.

@@ -36,6 +36,7 @@ stats = {
   'dns_lookups': 0,
   'dns_cached': 0,
   'wait_time': 0,
+  'aws_load_time': 0,
   'start_time': time.time()
 }
 
@@ -47,6 +48,7 @@ safedomains = []
 safeips = []
 safestrings = []
 safeorganizations = []
+safehostingproviders = []
 seedurls = {}
 
 records={}
@@ -90,14 +92,14 @@ def parseOptions():
   global args
   args = parser.parse_args()
 
-  print("Parsed args:")
-  print(f"Debug: {args.debug}")
-  print(f"Score: {args.score}")
+  log("Parsed args:", "debug")
+  log(f"Debug: {args.debug}", "debug")
+  log(f"Score: {args.score}", "debug")
   if args.aws_route53:
-    print(f"AWS Route53 mode enabled")
-    print(f"AWS Profile: {args.aws_profile if args.aws_profile else 'default'}")
+    log(f"AWS Route53 mode enabled", "debug")
+    log(f"AWS Profile: {args.aws_profile if args.aws_profile else 'default'}", "debug")
   else:
-    print(f"Input file: {args.input}")
+    log(f"Input file: {args.input}", "debug")
 
 def compare_records(current_records, previous_records):
   risky_diffs = []
@@ -149,10 +151,10 @@ def loadSafeDomains():
     # Remove whitespace
     line = re.sub("[ \n]", "", line)
     if line != "":
-      print(f"Adding \"{line}\" to safedomains")
+      log(f"Adding \"{line}\" to safedomains", "debug")
       safedomains.append(line)
   #  else:
-  #    print(f"Not adding \"{line}\" to safedomains")
+  #    log(f"Not adding \"{line}\" to safedomains", "debug")
   f.close()
 
 def loadSafeIPs():
@@ -165,10 +167,10 @@ def loadSafeIPs():
     # Remove whitespace
     line = re.sub("[ \n]", "", line)
     if line != "":
-      print(f"Adding \"{line}\" to safeips")
+      log(f"Adding \"{line}\" to safeips", "debug")
       safeips.append(line)
   #  else:
-  #    print(f"Not adding \"{line}\" to safeips")
+  #    log(f"Not adding \"{line}\" to safeips", "debug")
   f.close()
 
 def loadSafeStrings():
@@ -185,10 +187,10 @@ def loadSafeStrings():
     # Remove leading whitespace
     line = re.sub("^ *", "", line)
     if line != "":
-      print(f"Adding \"{line}\" to safestrings")
+      log(f"Adding \"{line}\" to safestrings", "debug")
       safestrings.append(line)
     else:
-      print(f"Not adding \"{line}\" to safestrings")
+      log(f"Not adding \"{line}\" to safestrings", "debug")
   f.close()
 
 def loadSafeOrganizations():
@@ -205,8 +207,23 @@ def loadSafeOrganizations():
     # Remove leading whitespace
     line = re.sub("^ *", "", line)
     if line != "":
-      print(f"Adding \"{line}\" to safeorganizations")
+      log(f"Adding \"{line}\" to safeorganizations", "debug")
       safeorganizations.append(line)
+  f.close()
+
+def loadSafeHostingProviders():
+  # Load safehostingproviders from safehostingproviders.txt
+  # Format: provider_name:IP_prefix
+  f = open(f"safehostingproviders.txt")
+  lines = f.readlines()
+  for line in lines:
+    # Remove comments
+    line = re.sub("#.*", "", line)
+    # Remove newlines and whitespace
+    line = re.sub("[\n ]", "", line)
+    if line != "":
+      log(f"Adding \"{line}\" to safehostingproviders", "debug")
+      safehostingproviders.append(line)
   f.close()
 
 def loadSeedURLs():
@@ -223,13 +240,14 @@ def loadSeedURLs():
     origLine = re.sub("\n", "", origLine)
     if line != "":
       domain = urlparse(line).netloc
-      print(f"Adding {domain}: {line} to seedurls")
+      log(f"Adding {domain}: {line} to seedurls", "debug")
       seedurls[domain] = line
     else:
-      print(f"Not adding anything from {origLine} to seedurls")
+      log(f"Not adding anything from {origLine} to seedurls", "debug")
 
 def loadDNSRecordsFromAWS():
-  log(f"Loading DNS records from AWS Route53.", "debug")
+  aws_start_time = time.time()
+  log(f"Loading DNS records from AWS Route53.", "info")
   try:
     session = boto3.Session(profile_name=args.aws_profile, region_name=args.aws_region)
     route53 = session.client('route53')
@@ -255,10 +273,12 @@ def loadDNSRecordsFromAWS():
                 'ResourceRecords': sorted(resource_records, key=lambda d: d['Value']),
                 'Score': 0
               }
-    log(f"Finished loading {len(records)} records from AWS Route53.", "debug")
+    stats['aws_load_time'] = time.time() - aws_start_time
+    log(f"Finished loading {len(records)} records from AWS Route53 in {stats['aws_load_time']:.2f}s.", "debug")
     return True
   except Exception as e:
-    print(f"Error loading records from AWS Route53: {e}")
+    stats['aws_load_time'] = time.time() - aws_start_time
+    log(f"Error loading records from AWS Route53: {e}", "error")
     return False
 
 def loadDNSRecords():
@@ -358,24 +378,24 @@ def getHttp(url):
     response = session.get(url, timeout=3, allow_redirects=False)
     stats['wait_time'] += (time.time() - start_time)
     if(time.time() - start_time > 1):
-      log(f"Slow response from {url}: {time.time() - start_time}", "tmpdebug")
+      log(f"Slow response from {url}: {time.time() - start_time}", "debug")
     return response, None
   except requests.exceptions.SSLError as e:
-    log(f"SSL error: {e} caused by {url}", "tmpdebug")
+    log(f"SSL error: {e} caused by {url}", "debug")
     return None, e
   except Exception as e:
     stats['wait_time'] += (time.time() - start_time)
-    log(f"HTTP error: {e} caused by {url}", "tmpdebug")
+    log(f"HTTP error: {e} caused by {url}", "debug")
     if(time.time() - start_time > 3):
       domain = urlparse(url).netloc
       ips = get_ipv4_by_hostname(domain)
       for ip in ips:
         if(ip in timeoutIPs):
-          log(f"IP {ip} already in timeoutIPs from {domain}.", "tmpdebug")
+          log(f"IP {ip} already in timeoutIPs from {domain}.", "debug")
         else:
-          log(f"Adding IP {ip} to timeoutIPs from {domain}.", "tmpdebug")
+          log(f"Adding IP {ip} to timeoutIPs from {domain}.", "debug")
           timeoutIPs.append(ip)
-      log(f"Slow response from {url}: {time.time() - start_time}. Adding {ips} to timeoutIPs", "tmpdebug")
+      log(f"Slow response from {url}: {time.time() - start_time}. Adding {ips} to timeoutIPs", "debug")
     return None, e
 
 def follow_redirects(record, response, url):
@@ -385,7 +405,7 @@ def follow_redirects(record, response, url):
         # If the redirect target is on the safe list, add 100.
         domain = urlparse(response.headers['location']).netloc
         if(domain in safedomains):
-            log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+            log(f"Raising score for redirect to safedomain {response.headers['location']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
             adjust_score(record, 100, "Redirect to safedomain")
             changed += 1
             redirectchain += 5 # Silly hack to prevent infinite loop here.
@@ -434,19 +454,31 @@ def get_certificate_organization(domain):
     log(f"Error getting certificate organization for {domain}: {e}", "debug")
   return None
 
+def check_ip_hosting_provider(ip):
+  """Check if IP address matches any known hosting providers.
+  Returns tuple (matched, provider_name) or (False, None)."""
+  for provider_entry in safehostingproviders:
+    # Format: provider_name:IP_prefix
+    if ':' not in provider_entry:
+      continue
+    provider_name, ip_prefix = provider_entry.split(':', 1)
+    if ip.startswith(ip_prefix):
+      return (True, provider_name)
+  return (False, None)
+
 def check_tls_status(record, url, response, errors, changed):
   # If we got a valid HTTP response, check certificate organization
   if response is not None and response.status_code > 100 and response.status_code < 600:
     org = get_certificate_organization(record)
     log(f"Certificate organization for {record}: {org}", "debug")
     if org and org in safeorganizations:
-      log(f"Raising score for response with correct EV SSL cert and matching organization: {record} ({records[record]['Score']} -> {records[record]['Score'] + 50}))", "tmpdebug")
+      log(f"Raising score for response with correct EV SSL cert and matching organization: {record} ({records[record]['Score']} -> {records[record]['Score'] + 50}))", "debug")
       adjust_score(record, 50, "Matching TLS cert with verified organization")
     elif org and org not in safeorganizations:
-      log(f"Lowering score for response with foreign organization: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25}))", "tmpdebug")
+      log(f"Lowering score for response with foreign organization: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25}))", "debug")
       adjust_score(record, -25, "Matching TLS cert but foreign organization")
     else:
-      log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "tmpdebug")
+      log(f"Raising score for response with correct SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] + 25}))", "debug")
       adjust_score(record, 25, "Matching TLS cert")
 
   if response is None:
@@ -461,7 +493,7 @@ def check_tls_status(record, url, response, errors, changed):
           log(f"Raising score for {record} found TLS SAN {san} in safedomains ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
           adjust_score(record, 50, "Safedomain found in TLS SAN")
       if not found:
-        log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+        log(f"Lowering score for response with wrong SSL cert: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "debug")
         adjust_score(record, -50, "Non-matching TLS cert")
       response = None
     elif(
@@ -564,59 +596,63 @@ def handle_ns_record(record):
 def handle_a_cname_record(record):
   log(f"Handling A or CNAME record: {record}", "debug")
   ips = get_ipv4_by_hostname(record)
+  changed = 0
 
-  if(records[record]['Score'] > 99 and record in safedomains):
-    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
-    return 0
-
-  elif(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
-    log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
-    return 0
-
-  elif(records[record]['Score'] > 99 and not record in safedomains):
-    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
-    safedomains.append(record)
-    return 1
-
-  elif(not ips):
+  if(not ips):
     log(f"DNS Lookup failure: {record} {ips}", "debug")
     adjust_score(record, -100, "DNS lookup failure")
-    return 0
+    return 1
 
-  elif('ResourceRecords' not in records[record] or len(records[record]['ResourceRecords']) == 0):
+  if('ResourceRecords' not in records[record] or len(records[record]['ResourceRecords']) == 0):
     log(f"No ResourceRecords found: {record}", "debug")
     adjust_score(record, 100, f"No ResourceRecords found for {record}")
-    return 0
+    return 1
 
-  elif(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
+  if(records[record]["Type"] == "A" and len(ips) > 0):
+    # Check if the IP belongs to a known hosting provider
+    # Being on a known hosting provider is a weak signal, but being on an unknown one is a strong negative signal.
+    matched, provider = check_ip_hosting_provider(ips[0])
+    if matched:
+      log(f"IP {ips[0]} belongs to known hosting provider {provider} for {record} ({records[record]['Score']} -> {records[record]['Score'] + 5})", "debug")
+      adjust_score(record, 5, f"IP on known hosting provider: {provider}")
+      changed += 1
+    else:
+      log(f"IP {ips[0]} does not belong to known hosting provider for {record}", "debug")
+      adjust_score(record, -25, "IP not on known hosting provider")
+      changed += 1
+
+  if(records[record]["Type"] == "A" and 'ResourceRecords' in records[record]
     and ( records[record]['ResourceRecords'][0]['Value'][:3] == '10.' or records[record]['ResourceRecords'][0]['Value'][:8] == '192.168.')):
-    log(f"Private range safe: ({record} -> {records[record]['ResourceRecords'][0]['Value']}) ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    # On second thoughts, this isn't safe. Imagine internet cafe scenario.
+    # Someone in the cafe sets their IP to the private IP returned by this record.
+    # Then tricks another user in the cafe to visit the domain. They then effectively have a subdomain takeover for that one user.
+    log(f"Private range safe: ({record} -> {records[record]['ResourceRecords'][0]['Value']}) ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "Private range")
     return 1
 
   elif(records[record]["Type"] == "CNAME"
     and records[record]['ResourceRecords'][0]['Value'] in safedomains):
-    log(f"Raising score for CNAME pointing to {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    log(f"Raising score for CNAME pointing to {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "CNAME points to safedomain")
     return 1
 
   elif(records[record]["Type"] == "A"
     and 'AliasTarget' in records[record]
     and records[record]['AliasTarget']['DNSName'] in safedomains):
-    log(f"Raising score for Alias pointing to {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    log(f"Raising score for Alias pointing to {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "Alias points to safedomain")
     return 1
 
   elif(records[record]["Type"] == "CNAME"
     and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
-    log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    log(f"Raising score for CNAME pointing to high entropy ELB domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "CNAME points to high entropy ELB domain")
     return 1
 
   elif(records[record]["Type"] == "A"
     and 'AliasTarget' in records[record]
     and re.findall('.*[0-9]*.eu-west-1.elb.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
-    log(f"Raising score for Alias pointing to high entropy domain {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    log(f"Raising score for Alias pointing to high entropy domain {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "Alias points to high entropy domain")
     if(records[record]['AliasTarget']['DNSName'][:-1] not in safedomains):
         safedomains.append(records[record]['AliasTarget']['DNSName'][:-1])
@@ -624,27 +660,27 @@ def handle_a_cname_record(record):
 
   elif(records[record]["Type"] == "CNAME"
     and re.findall(r'.*\.s3-website-eu-west-1.amazonaws.com', records[record]['ResourceRecords'][0]['Value']) ):
-    log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "tmpdebug")
+    log(f"Raising score for CNAME pointing to high entropy domain {records[record]['ResourceRecords'][0]['Value']}: {record} ({records[record]['Score']} -> {records[record]['Score'] + 100})", "debug")
     adjust_score(record, 100, "CNAME points to high entropy S3 domain")
     return 1
 
   elif(records[record]["Type"] == "A"
     and 'AliasTarget' in records[record]
     and re.findall('s3-website-eu-west-1.amazonaws.com', records[record]['AliasTarget']['DNSName']) ):
-    log(f"Lowering score for Alias pointing to generic S3 endpoint {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25})", "tmpdebug")
+    log(f"Lowering score for Alias pointing to generic S3 endpoint {records[record]['AliasTarget']['DNSName']}: {record} ({records[record]['Score']} -> {records[record]['Score'] - 25})", "debug")
     adjust_score(record, -25, "Alias points to S3 endpoint")
-    return 1
+    return changed + 1
 
   elif(record in timeoutDomains):
-    log(f"Domain is known to time out, not requesting again: {record}", "tmpdebug")
-    return 0
+    log(f"Domain is known to time out, not requesting again: {record}", "debug")
+    return changed
 
   elif(len(ips) > 0 and ips[0] in timeoutIPs):
-      log(f"IP is known to time out, not requesting again: {record} {get_ipv4_by_hostname(record)[0]}", "tmpdebug")
-      return 0
+    log(f"IP is known to time out, not requesting again: {record} {get_ipv4_by_hostname(record)[0]}", "debug")
+    return changed
 
   else:
-        return analyse_http(record)
+    return analyse_http(record) + changed
 
 
 def adjust_score(record, score_change, reason = "Unknown"):
@@ -671,7 +707,7 @@ def adjust_score(record, score_change, reason = "Unknown"):
   elif(records[record]['Score'] < -99):
     log(f"Score change for {record} means it is now unsafe: {records[record]['Score']}. {reason}", "debug")
   else:
-    log(f"Score change for {record} leaves it still in the middle: {records[record]['Score']}", "info")
+    log(f"Score change for {record} leaves it still in the middle: {records[record]['Score']}", "debug")
 
 def adjust_ns_score(record, nameserver, score_change, reason = "Unknown"):
   if nameserver not in records[record]:
@@ -687,27 +723,44 @@ def adjust_ns_score(record, nameserver, score_change, reason = "Unknown"):
   # Check all nameservers in this record to see if they are safe or unsafe
 
 def process_record(record):
-    if('_' in record):
-        adjust_score(record, 100, "Record with underscore")
-        log(f"Ignoring records with underscores ({record})", "debug")
-        return 0
+  if(records[record]['Score'] > 99 and record in safedomains):
+    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
+    return 0
 
-    if(records[record]['Type'] == 'SOA'
-      or records[record]['Type'] == 'TXT'
-      or records[record]['Type'] == 'MX'
-      or records[record]['Type'] == 'PTR'):
-        log(f"Ignoring {records[record]['Type']} records ({records[record]['Name']})", "debug")
-        return 0
+  if(records[record]['Score'] < -99 and records[record]['Score'] > -199 ):
+    log(f"Already unsafe: {records[record]['Score']} ({record})", "debug")
+    return 0
 
-    elif(records[record]['Type'] == 'A' or records[record]['Type'] == 'CNAME'):
-        return handle_a_cname_record(record)
+  if(records[record]['Score'] > 99 and not record in safedomains):
+    log(f"Already safe: {records[record]['Score']} ({record})", "debug")
+    safedomains.append(record)
+    return 1
 
-    elif(records[record]['Type'] == 'NS'):
-        return handle_ns_record(record)
+  if('_' in record):
+    adjust_score(record, 100, "Record with underscore")
+    log(f"Ignoring records with underscores ({record})", "debug")
+    return 0
 
-    elif(records[record]['Type'] not in ['A', 'CNAME', 'NS']):
-        log(f"Not handled record type: {records[record]['Type']} {record}", "debug")
-        return 0
+  if('Type' not in records[record]):
+    log(f"No Type found for record ({record})", "debug")
+    return 0
+
+  if(records[record]['Type'] == 'SOA'
+    or records[record]['Type'] == 'TXT'
+    or records[record]['Type'] == 'MX'
+    or records[record]['Type'] == 'PTR'):
+      log(f"Ignoring {records[record]['Type']} records ({records[record]['Name']})", "debug")
+      return 0
+
+  elif(records[record]['Type'] == 'A' or records[record]['Type'] == 'CNAME'):
+    return handle_a_cname_record(record)
+
+  elif(records[record]['Type'] == 'NS'):
+    return handle_ns_record(record)
+
+  elif(records[record]['Type'] not in ['A', 'CNAME', 'NS']):
+    log(f"Not handled record type: {records[record]['Type']} {record}", "debug")
+    return 0
 
 def check_csp_header(record, response):
   """Check if Content-Security-Policy header contains any safedomains."""
@@ -720,7 +773,7 @@ def check_csp_header(record, response):
   changed = 0
   for safedomain in safedomains:
     if safedomain in csp_header:
-      log(f"Found safedomain {safedomain} in CSP header for {record} ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
+      log(f"Found safedomain {safedomain} in CSP header for {record} ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
       adjust_score(record, 50, f"Safedomain {safedomain} found in CSP header")
       changed += 1
 
@@ -739,12 +792,11 @@ def analyse_http(record):
 
     if(response is None):
         if('Timeout' in str(errors)):
-            log(f"Lowering score for no http(s) response: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "tmpdebug")
+            log(f"Lowering score for no http(s) response: {record} ({records[record]['Score']} -> {records[record]['Score'] - 50}))", "debug")
             adjust_score(record, -50, "No http(s) response")
             changed += 1
         else:
-            log(f"Other http error {str(errors)}", "tmpdebug")
-
+            log(f"Other http error {str(errors)}", "debug")
     elif(response.status_code > 100 and response.status_code < 600):
         # Check CSP header for safedomains
         changed += check_csp_header(record, response)
@@ -752,12 +804,12 @@ def analyse_http(record):
         for safestring in safestrings:
             log(f"Looking for {safestring} in https://{record}", "debug")
             if(safestring.encode('utf-8') in response.content):
-                log(f"Increasing score for safestring: {record} ({safestring}) ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
+                log(f"Increasing score for safestring: {record} ({safestring}) ({records[record]['Score']} -> {records[record]['Score'] + 50})", "debug")
                 adjust_score(record, 50, "Safestring found")
                 changed += 1
         changed += follow_redirects(record, response, url)
     else:
-        log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "tmpdebug")
+        log(f"Unknown http response situation {response.headers['location']}: {record} is now {records[record]['Score']}", "debug")
     return changed
 
 ############################## Main ########################
@@ -767,6 +819,7 @@ loadSafeDomains()
 loadSafeIPs()
 loadSafeStrings()
 loadSafeOrganizations()
+loadSafeHostingProviders()
 loadSeedURLs()
 loadDNSRecords()
 
@@ -783,9 +836,9 @@ while changed > 0:
         for future in as_completed(futures):
             result = future.result()
             if result:
-                changed += result
-    log(f"Changed {changed} scores during this loop.", "tmpdebug")
-    log(f"safedomains now contains {len(safedomains)} domains.", "tmpdebug")
+              changed += result
+    log(f"Changed {changed} scores during this loop.", "debug")
+    log(f"safedomains now contains {len(safedomains)} domains.", "debug")
 
 # End main loop, report results and finish up
 

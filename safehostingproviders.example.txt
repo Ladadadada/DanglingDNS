@@ -1,0 +1,56 @@
+# List of known hosting provider IP ranges that indicate domain ownership
+# Format: provider_name:IP_CIDR_range or provider_name:IP_prefix
+# One entry per line, comments start with #
+
+# AWS
+AWS:54.
+AWS:35.
+AWS:52.
+AWS:1.2.
+
+# Azure
+Azure:13.64.
+Azure:13.65.
+Azure:13.66.
+Azure:13.67.
+Azure:13.68.
+Azure:40.64.
+Azure:40.65.
+
+# Google Cloud
+GCP:35.184.
+GCP:35.185.
+GCP:35.186.
+GCP:35.187.
+GCP:35.188.
+GCP:35.189.
+GCP:35.190.
+
+# Cloudflare
+Cloudflare:104.16.
+Cloudflare:104.17.
+Cloudflare:104.18.
+Cloudflare:104.19.
+
+# Digital Ocean
+DigitalOcean:104.131.
+DigitalOcean:104.236.
+DigitalOcean:159.65.
+DigitalOcean:167.99.
+
+# Linode
+Linode:45.33.
+Linode:45.34.
+Linode:45.35.
+Linode:45.36.
+
+# Heroku
+Heroku:50.19.
+Heroku:54.69.
+Heroku:54.153.
+
+# GitHub Pages (GitHub/Microsoft)
+GitHubPages:185.199.108.
+GitHubPages:185.199.109.
+GitHubPages:185.199.110.
+GitHubPages:185.199.111.
