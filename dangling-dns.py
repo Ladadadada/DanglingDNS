@@ -392,15 +392,16 @@ def follow_redirects(record, response, url):
             break
         else:
             # If this is a path, add the domain and protocol. If this has no protocol, add one.
-            log(f"Following redirect from {url} to {response.headers['location']}", "tmpdebug")
+            log(f"Following redirect from {url} to {response.headers['location']}", "debug")
             redirectchain += 1
-            url = response.headers['location']
-            if url.startswith('//'):
-                url = f"https:{url}"
-                log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
-            elif url.startswith('/'):
-                url = f"https://{record}{url}"
-                log(f"Updated redirect from {response.headers['location']} to {url}", "tmpdebug")
+            newurl = response.headers['location']
+            if newurl.startswith('//'):
+                newurl = f"https:{newurl}"
+                log(f"Updated redirect from {response.headers['location']} to {newurl}", "debug")
+            elif newurl.startswith('/'):
+                newurl = f"https://{urlparse(url).netloc}{newurl}"
+                log(f"Updated redirect from {response.headers['location']} to {newurl}", "debug")
+            url = newurl
             response, _ = getHttp(url)
     # If we exit due to too many redirects, do nothing here (handled in analyse_http)
     return changed
@@ -705,8 +706,25 @@ def process_record(record):
         return handle_ns_record(record)
 
     elif(records[record]['Type'] not in ['A', 'CNAME', 'NS']):
-        log(f"Not handled record type: {records[record]['Type']} {record}", "debugn")
+        log(f"Not handled record type: {records[record]['Type']} {record}", "debug")
         return 0
+
+def check_csp_header(record, response):
+  """Check if Content-Security-Policy header contains any safedomains."""
+  if response is None or 'content-security-policy' not in response.headers:
+    return 0
+
+  csp_header = response.headers.get('content-security-policy', '')
+  log(f"CSP header for {record}: {csp_header}", "debug")
+
+  changed = 0
+  for safedomain in safedomains:
+    if safedomain in csp_header:
+      log(f"Found safedomain {safedomain} in CSP header for {record} ({records[record]['Score']} -> {records[record]['Score'] + 50})", "tmpdebug")
+      adjust_score(record, 50, f"Safedomain {safedomain} found in CSP header")
+      changed += 1
+
+  return changed
 
 def analyse_http(record):
     if record in seedurls:
@@ -728,6 +746,9 @@ def analyse_http(record):
             log(f"Other http error {str(errors)}", "tmpdebug")
 
     elif(response.status_code > 100 and response.status_code < 600):
+        # Check CSP header for safedomains
+        changed += check_csp_header(record, response)
+
         for safestring in safestrings:
             log(f"Looking for {safestring} in https://{record}", "debug")
             if(safestring.encode('utf-8') in response.content):

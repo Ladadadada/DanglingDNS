@@ -1,7 +1,9 @@
-# Seed URLs are for sites where the home page does not contain any identifying clues but other pages on the site do.
+# Seed URLs are for domains where the home page does not contain any identifying clues but other pages on the site do.
+# If you find that a domain you know is safe is being identified as risky, and there are better paths on that domain that would help DanglingDNS
+# do a better job, list them here.
 # You can include any URLs for any domains in here.
 # If you include multiple URLs for the same domain, DanglingDNS will request all of them. (Not implemented yet.)
-# When DanglingDNS is evaluating a domain that exists in this file it will use the paths here instead of /.
+# When DanglingDNS is evaluating a domain that exists in this file it will use the paths here instead of the path `/`.
 
 https://email.example.com/subscribe/newsletter     # Our newsletter subscription service has nothing on the home page.
 https://shorturl.example.net/LinkInOurSocialMedia  # Our URL shortening service has nothing on the home page.

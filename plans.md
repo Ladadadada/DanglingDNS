@@ -44,9 +44,11 @@ Verify certificate issuance history:
 - Check who requested the certificate
 - Identify suspicious certificate patterns
 
-Known registrars
-Known hosting providers
-Known technologies such as Apache or nginx
+Known registrars - Useful for domains that have expired and we no longer own. No help on subdomains. Anything else?
+Known hosting providers. Good for detecting when we have changed hosting providers and left DNS records pointing at the old one.
+Known technologies such as Apache or nginx. Potentially useful, but a fairly weak signal, especially if we use several.
+Run any found domains (in HTML or headers) through reputation service. Subdomains that have been taken over may have malicious code using known malicious domains.
+Convert various .txt files to a single config file with sections.
 
 
 ## Priority Implementation
@@ -55,42 +57,4 @@ Start with these most practical signals:
 2. **Response body analysis** - Detect placeholder pages and company signatures
 3. **HTTP header inspection** - Look for infrastructure-specific headers
 
-## Implementation: Certificate Organization Field
 
-### Configuration
-Add a new config file `safeorganizations.txt` containing company names/organizations that own our certificates:
-- One organization per line
-- These should match the Organization (O) field in the certificate subject
-- Examples: "Example Inc.", "Example Corporation", "Example Ltd"
-
-### Code Changes Required
-
-1. **Load safe organizations** (similar to `loadSafeDomains()`)
-   - New function `loadSafeOrganizations()`
-   - Parse `safeorganizations.txt`
-   - Store in global `safeorganizations` list
-
-2. **Extract certificate organization** (enhance `get_tls_names()`)
-   - Already getting the certificate, add extraction of Organization field
-   - Return organization name along with SANs
-   - New function: `get_certificate_organization(domain)`
-
-3. **Score adjustment in `check_tls_status()`**
-   - When we get a valid response AND matching SSL cert:
-     - Extract organization from certificate
-     - If organization in `safeorganizations`: +50 points (ownership verified)
-     - If organization NOT in `safeorganizations`: -25 points (suspicious cert)
-     - If organization extraction fails: no change (neutral)
-
-### Logic Flow
-```
-Valid HTTP response + matching TLS cert:
-  → Extract certificate organization
-    → Organization in safeorganizations? 
-      → YES: +50 (ownership verified)
-      → NO: -25 (foreign certificate, likely dangling)
-    → No organization found?
-      → Neutral (keep existing +25 from response)
-```
-
-This prevents dangling domains with attacker-controlled certificates from getting a false positive score.
