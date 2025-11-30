@@ -14,10 +14,9 @@ import dns.resolver
 # AWS
 import boto3
 
-
+# Standard library
 import json
-from pprint import pprint
-import os
+import sys
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,6 +55,8 @@ records={}
 timeoutIPs = []
 timeoutDomains = []
 
+custom_dns_servers = []  # Custom DNS servers for resolution, empty means use system defaults
+
 def parseOptions():
   # Potential options:
   # -d --debug debug mode
@@ -89,6 +90,10 @@ def parseOptions():
   parser.add_argument('--aws-region', type=str, default='us-east-1',
                       help='AWS region to use. Default: us-east-1')
 
+  # Custom DNS servers
+  parser.add_argument('--dns-servers', type=str, default=None,
+                      help='Comma-separated list of custom DNS servers (e.g., 8.8.8.8,1.1.1.1). Default: system resolvers.')
+
   global args
   args = parser.parse_args()
 
@@ -96,10 +101,17 @@ def parseOptions():
   log(f"Debug: {args.debug}", "debug")
   log(f"Score: {args.score}", "debug")
   if args.aws_route53:
-    log(f"AWS Route53 mode enabled", "debug")
+    log("AWS Route53 mode enabled", "debug")
     log(f"AWS Profile: {args.aws_profile if args.aws_profile else 'default'}", "debug")
   else:
     log(f"Input file: {args.input}", "debug")
+
+  global custom_dns_servers
+  if args.dns_servers:
+    custom_dns_servers = [s.strip() for s in args.dns_servers.split(',')]
+    log(f"Custom DNS servers configured: {custom_dns_servers}", "debug")
+  else:
+    log("Using system default DNS resolvers", "debug")
 
 def compare_records(current_records, previous_records):
   risky_diffs = []
@@ -245,6 +257,28 @@ def loadSeedURLs():
     else:
       log(f"Not adding anything from {origLine} to seedurls", "debug")
 
+def load_zone_records(zone_id, zone_name, route53_client):
+  """Load all DNS records for a single hosted zone."""
+  try:
+    zone_records = {}
+    record_paginator = route53_client.get_paginator('list_resource_record_sets')
+    for record_page in record_paginator.paginate(HostedZoneId=zone_id):
+      for record_set in record_page['ResourceRecordSets']:
+        if record_set['Type'] in ['A', 'CNAME', 'NS']:
+          record_name = record_set['Name'].rstrip('.')
+          resource_records = [{'Value': rr['Value']} for rr in record_set.get('ResourceRecords', [])]
+          zone_records[record_name] = {
+            'Name': record_name,
+            'Type': record_set['Type'],
+            'ResourceRecords': sorted(resource_records, key=lambda d: d['Value']),
+            'Score': 0
+          }
+    log(f"Loaded {len(zone_records)} records from zone {zone_name}", "debug")
+    return zone_records
+  except Exception as e:
+    log(f"Error loading records from zone {zone_name}: {e}", "error")
+    return {}
+
 def loadDNSRecordsFromAWS():
   aws_start_time = time.time()
   log(f"Loading DNS records from AWS Route53.", "info")
@@ -252,34 +286,42 @@ def loadDNSRecordsFromAWS():
     session = boto3.Session(profile_name=args.aws_profile, region_name=args.aws_region)
     route53 = session.client('route53')
 
-    # List all hosted zones
+    # Get list of hosted zones
     paginator = route53.get_paginator('list_hosted_zones')
+    zones = []
     for page in paginator.paginate():
       for zone in page['HostedZones']:
         zone_id = zone['Id']
         zone_name = zone['Name'].rstrip('.')
-        log(f"Processing hosted zone: {zone_name}", "debug")
+        zones.append((zone_id, zone_name))
 
-        # List all records in this zone
-        record_paginator = route53.get_paginator('list_resource_record_sets')
-        for record_page in record_paginator.paginate(HostedZoneId=zone_id):
-          for record_set in record_page['ResourceRecordSets']:
-            if record_set['Type'] in ['A', 'CNAME', 'NS']:
-              record_name = record_set['Name'].rstrip('.')
-              resource_records = [{'Value': rr['Value']} for rr in record_set.get('ResourceRecords', [])]
-              records[record_name] = {
-                'Name': record_name,
-                'Type': record_set['Type'],
-                'ResourceRecords': sorted(resource_records, key=lambda d: d['Value']),
-                'Score': 0
-              }
+    log(f"Found {len(zones)} hosted zones to process", "debug")
+
+    # Load records from all zones in parallel
+    with ThreadPoolExecutor(max_workers=10) as executor:
+      futures = {executor.submit(load_zone_records, zone_id, zone_name, route53): (zone_id, zone_name)
+                 for zone_id, zone_name in zones}
+
+      for future in as_completed(futures):
+        zone_records = future.result()
+        # Merge zone records into main records dict
+        records.update(zone_records)
+
     stats['aws_load_time'] = time.time() - aws_start_time
     log(f"Finished loading {len(records)} records from AWS Route53 in {stats['aws_load_time']:.2f}s.", "debug")
     return True
-  except Exception as e:
+  except (boto3.exceptions.Boto3Error, Exception) as e:
     stats['aws_load_time'] = time.time() - aws_start_time
-    log(f"Error loading records from AWS Route53: {e}", "error")
-    return False
+    error_msg = str(e)
+    # Check if this is a credential-related error
+    if any(keyword in error_msg for keyword in ['InvalidClientTokenId', 'SignatureDoesNotMatch', 'NotAuthorizedToOperateOnLambdaFunction', 'UnrecognizedClientException', 'AccessDenied']):
+      log(f"ERROR: Invalid AWS credentials. Please check your AWS profile '{args.aws_profile}' and region '{args.aws_region}'.", "error")
+      log(f"Details: {error_msg}", "error")
+      sys.exit(1)
+    else:
+      log(f"ERROR: Failed to load DNS records from AWS Route53: {error_msg}", "error")
+      log(f"Please verify your AWS configuration and try again.", "error")
+      sys.exit(1)
 
 def loadDNSRecords():
   if args.aws_route53:
@@ -307,7 +349,7 @@ def log(message, level):
   if(args.debug == False and level == "debug"):
     pass
   else:
-    print(f"{datetime.now()} {message}")
+    print(f"{datetime.now()} [{level.upper()}] {message}")
 
 def retrySession(retries, session=None, backoff_factor=0.3):
   session = session or requests.Session()
@@ -329,6 +371,64 @@ def query_ns(nameserver, hostname, record_type):
   resolver.nameservers = [nameserver]
 
   return resolver.resolve(qname = hostname, rdtype = record_type)
+
+def get_resolver_with_custom_servers():
+  """Get a DNS resolver configured with custom servers if provided, otherwise use system defaults."""
+  resolver = dns.resolver.Resolver()
+  if custom_dns_servers:
+    resolver.nameservers = custom_dns_servers
+    log(f"Using custom DNS servers: {custom_dns_servers}", "debug")
+  return resolver
+
+def get_authoritative_ns_records(hostname):
+  """Query authoritative nameservers to get the true NS records for a domain.
+  Returns a sorted list of authoritative NS server names, or empty list on failure."""
+  try:
+    # Use resolver with custom servers if configured, otherwise system defaults
+    resolver = get_resolver_with_custom_servers()
+    resolver.use_edns(0, dns.flags.DO, 1200)
+
+    # Query for NS records - this will follow referrals to authoritative nameservers
+    ns_answer = resolver.resolve(hostname, 'NS')
+    authoritative_ns = sorted([str(rr).rstrip('.') for rr in ns_answer])
+
+    log(f"Authoritative NS records for {hostname}: {authoritative_ns}", "debug")
+    return authoritative_ns
+  except Exception as e:
+    log(f"Failed to query authoritative NS records for {hostname}: {e}", "debug")
+    return []
+
+def validate_ns_records(record, route53_ns_list):
+  """Compare Route53 NS records against authoritative nameservers.
+  Returns (has_mismatch, mismatched_servers, authoritative_ns) tuple."""
+  # Extract nameserver names from Route53 records (strip trailing dots)
+  route53_ns = sorted([ns.rstrip('.') for ns in route53_ns_list])
+
+  # Get authoritative NS records
+  authoritative_ns = get_authoritative_ns_records(record)
+
+  if not authoritative_ns:
+    log(f"Could not retrieve authoritative NS records for {record}, skipping validation", "debug")
+    return (False, [], [])
+
+  # Compare the two lists
+  route53_set = set(route53_ns)
+  authoritative_set = set(authoritative_ns)
+
+  # Find nameservers in Route53 that aren't authoritative
+  stale_ns = route53_set - authoritative_set
+  # Find nameservers that are authoritative but missing from Route53
+  missing_ns = authoritative_set - route53_set
+
+  has_mismatch = len(stale_ns) > 0 or len(missing_ns) > 0
+
+  if has_mismatch:
+    if stale_ns:
+      log(f"Stale NS records in Route53 for {record}: {stale_ns}", "warning")
+    if missing_ns:
+      log(f"Missing authoritative NS records in Route53 for {record}: {missing_ns}", "warning")
+
+  return (has_mismatch, list(stale_ns), authoritative_ns)
 
 
 def get_ipv4_by_hostname(hostname):
@@ -509,6 +609,18 @@ def check_tls_status(record, url, response, errors, changed):
 def handle_ns_record(record):
   # Check NS records for dangling potential by verifying if the NS nameserver is valid
   if('ResourceRecords' in records[record] and len(records[record]['ResourceRecords']) > 0):
+    # First, validate the NS records against authoritative sources
+    ns_list = [ns['Value'] for ns in records[record]['ResourceRecords']]
+    has_mismatch, stale_ns, authoritative_ns = validate_ns_records(record, ns_list)
+
+    if has_mismatch:
+      if stale_ns:
+        log(f"NS record validation for {record} found stale entries: {stale_ns}", "info")
+        # Penalize for each stale nameserver
+        for stale_server in stale_ns:
+          adjust_score(record, -50, f"Stale NS record: {stale_server} (not authoritative)")
+      log(f"Authoritative NS records for {record}: {authoritative_ns}", "debug")
+
     for ns_record in records[record]['ResourceRecords']:
       # Check score threshold to end early if already conclusive
       if records[record]['Score'] > 99 or records[record]['Score'] < -99:
@@ -821,7 +933,15 @@ loadSafeStrings()
 loadSafeOrganizations()
 loadSafeHostingProviders()
 loadSeedURLs()
-loadDNSRecords()
+
+# Load DNS records - will exit with error message if AWS credentials are invalid
+if not loadDNSRecords():
+    log(f"ERROR: Failed to load DNS records. Exiting.", "error")
+    sys.exit(1)
+
+if len(records) == 0:
+    log(f"ERROR: No DNS records loaded. Please check your input file or AWS credentials.", "error")
+    sys.exit(1)
 
 # Main loop
 # filter out everything we can without network requests

@@ -4,6 +4,7 @@ safeips.txt
 safestrings.txt
 seedurls.txt
 safeorganizations.txt
+safehostingproviders.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

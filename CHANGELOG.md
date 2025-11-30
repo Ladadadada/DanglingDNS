@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added `--dns-servers` option to specify custom DNS servers for resolution. Pass a comma-separated list of IP addresses (e.g., `--dns-servers 8.8.8.8,1.1.1.1`) to override system default resolvers. Useful for testing with specific DNS configurations, private DNS services, or when running in restricted network environments. System defaults are used if this option is not provided.
+- Added NS record validation against authoritative nameservers. When processing NS records, the code now queries the authoritative nameservers and compares them against what's stored in Route53. This detects stale or misconfigured NS records that may indicate DNS configuration errors. Each stale nameserver found results in -50 points. This helps identify outdated DNS records that could represent security risks if not resolved.
 - Added known hosting provider IP detection. When an A record resolves, the code checks if the IP belongs to a known hosting provider (AWS, Azure, GCP, etc.) configured in `safehostingproviders.txt`. IPs matching known providers are awarded +5 points, as this is a weak signal.
 Not being on a known hosting provider is a fairly strong negative signal.
 Pre-populated example file includes common providers.

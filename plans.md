@@ -1,8 +1,5 @@
 # Ownership Verification Signals
 
-## Problem
-The domain `which.blog` is getting a positive score because of matching SSL certificate, but this doesn't guarantee ownership - a dangling DNS record can still point to attacker infrastructure with a valid SSL cert.
-
 ## Proposed Signals to Verify Domain Ownership
 
 ### 1. HTTP Response Headers
