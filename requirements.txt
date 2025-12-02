@@ -1,4 +1,4 @@
-cryptography==41.0.2
+cryptography==44.0.1
 Requests==2.32.4
 urllib3==2.0.4
 dnspython==2.8.0
