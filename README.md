@@ -80,3 +80,88 @@ Suspicious signals
 -    This is really just the "known domain" pattern which I already think isn't a good idea.
 -  An HTTPS response includes an SSL certificate that does not contain the record or the parent domain name.
 -    Except if the certificate presented is for a valid domain. Lots of parked domains only work on http.
+
+# Configuration
+
+DanglingDNS supports configuration files to store your preferred settings, eliminating the need to specify all options on the command line each time.
+
+## Configuration File Formats
+
+DanglingDNS supports both **INI format** (.conf, .ini) and **JSON format** (.json) for configuration files.
+
+### INI Format Example
+
+Create a file named `dangling-dns.conf`:
+
+```ini
+[dangling-dns]
+debug = false
+score = 90
+input = ./records.txt
+aws-route53 = false
+aws-region = us-east-1
+```
+
+### JSON Format Example
+
+Create a file named `dangling-dns.conf.json`:
+
+```json
+{
+  "dangling-dns": {
+    "debug": false,
+    "score": 90,
+    "input": "./records.txt",
+    "aws-route53": false,
+    "aws-region": "us-east-1"
+  }
+}
+```
+
+## Default Configuration Locations
+
+DanglingDNS automatically searches for configuration files in this order:
+
+1. Path specified with `--config` flag (if provided)
+2. `./dangling-dns.conf` (current directory)
+3. `~/.dangling-dns.conf` (home directory)
+
+If a config file is found, it will be automatically loaded. If multiple locations have config files, only the first found is used.
+
+## Command Line Precedence
+
+Command-line arguments **always take precedence** over configuration file values. This allows you to:
+
+- Store common settings in a config file
+- Override specific settings for a particular run
+
+Example:
+
+```bash
+# Uses score from config file (if set)
+python3 dangling-dns.py
+
+# Overrides config file score with 75 for this run only
+python3 dangling-dns.py --score 75
+
+# Loads specific config file
+python3 dangling-dns.py --config production.conf
+
+# Overrides a setting from the config file
+python3 dangling-dns.py --config production.conf --debug
+```
+
+## Available Configuration Options
+
+All command-line options can be specified in a configuration file:
+
+- `debug` (true/false) - Enable debug mode
+- `score` (0-100) - Score threshold for dangling DNS detection
+- `input` (path) - Input file path for DNS records
+- `compare-to` (path or "previous") - Compare against previous results
+- `aws-route53` (true/false) - Fetch records from AWS Route53
+- `aws-profile` (string) - AWS profile name to use
+- `aws-region` (string) - AWS region for Route53
+- `dns-servers` (comma-separated IPs) - Custom DNS servers to use
+
+See `dangling-dns.example.conf` and `dangling-dns.example.json` for complete examples with all options and descriptions.

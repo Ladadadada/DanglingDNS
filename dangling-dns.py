@@ -18,6 +18,9 @@ import boto3
 import json
 import sys
 import time
+import os
+import glob
+import configparser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -57,6 +60,132 @@ timeoutDomains = []
 
 custom_dns_servers = []  # Custom DNS servers for resolution, empty means use system defaults
 
+def parse_ini_config(section):
+  """Parse INI config section and return argv list."""
+  argv = []
+
+  # Debug mode
+  if section.getboolean('debug', False):
+    argv.append('--debug')
+
+  # Score threshold
+  if 'score' in section:
+    argv.extend(['--score', section['score']])
+
+  # Input file
+  if 'input' in section:
+    argv.extend(['--input', section['input']])
+
+  # Compare to file
+  if 'compare-to' in section:
+    argv.extend(['--compare-to', section['compare-to']])
+
+  # AWS Route53 mode
+  if section.getboolean('aws-route53', False):
+    argv.append('--aws-route53')
+
+  # AWS profile
+  if 'aws-profile' in section:
+    argv.extend(['--aws-profile', section['aws-profile']])
+
+  # AWS region
+  if 'aws-region' in section:
+    argv.extend(['--aws-region', section['aws-region']])
+
+  # DNS servers
+  if 'dns-servers' in section:
+    argv.extend(['--dns-servers', section['dns-servers']])
+
+  return argv
+
+def parse_json_config(config_dict):
+  """Parse JSON config dict and return argv list."""
+  argv = []
+
+  # Debug mode
+  if config_dict.get('debug', False):
+    argv.append('--debug')
+
+  # Score threshold
+  if 'score' in config_dict:
+    argv.extend(['--score', str(config_dict['score'])])
+
+  # Input file
+  if 'input' in config_dict:
+    argv.extend(['--input', config_dict['input']])
+
+  # Compare to file
+  if 'compare-to' in config_dict:
+    argv.extend(['--compare-to', config_dict['compare-to']])
+
+  # AWS Route53 mode
+  if config_dict.get('aws-route53', False):
+    argv.append('--aws-route53')
+
+  # AWS profile
+  if 'aws-profile' in config_dict:
+    argv.extend(['--aws-profile', config_dict['aws-profile']])
+
+  # AWS region
+  if 'aws-region' in config_dict:
+    argv.extend(['--aws-region', config_dict['aws-region']])
+
+  # DNS servers
+  if 'dns-servers' in config_dict:
+    argv.extend(['--dns-servers', config_dict['dns-servers']])
+
+  return argv
+
+def load_config_file(config_file):
+  """Load configuration from a file and convert to command-line arguments.
+  Returns a list of arguments that can be parsed by argparse.
+  Supports both INI format (.conf, .ini, .cfg) and JSON format (.json).
+  """
+  argv = []
+
+  if not os.path.exists(config_file):
+    print(f"WARNING: Config file not found: {config_file}")
+    return argv
+
+  try:
+    # Try INI format
+    if config_file.endswith(('.conf', '.ini', '.cfg')):
+      config = configparser.ConfigParser()
+      config.read(config_file)
+
+      if 'dangling-dns' in config:
+        argv = parse_ini_config(config['dangling-dns'])
+
+    # Try JSON format
+    elif config_file.endswith('.json'):
+      with open(config_file, 'r') as f:
+        config_data = json.load(f)
+
+      # Ensure the config is under a 'dangling-dns' key or is a flat dict
+      if 'dangling-dns' in config_data:
+        config_dict = config_data['dangling-dns']
+      else:
+        config_dict = config_data
+
+      argv = parse_json_config(config_dict)
+
+  except Exception as e:
+    print(f"ERROR: Failed to parse config file {config_file}: {e}")
+    sys.exit(1)
+
+  return argv
+
+def find_default_config_file():
+  """Search for default config file locations."""
+  default_paths = [
+    os.path.expanduser('./dangling-dns.conf'),
+    os.path.expanduser('~/.dangling-dns.conf'),
+  ]
+  for path in default_paths:
+    if os.path.exists(path):
+      return path
+  return None
+
 def parseOptions():
   # Potential options:
   # -d --debug debug mode
@@ -65,6 +194,10 @@ def parseOptions():
   # -i input domains file
 
   parser = argparse.ArgumentParser(description='Dangling DNS evaluator.')
+
+  # Config file (parse this first to set defaults)
+  parser.add_argument('--config', type=str, default=None,
+                      help='Path to configuration file (INI or JSON format).')
 
   # Debug
   parser.add_argument('-d', '--debug', action='store_true',
@@ -94,8 +227,25 @@ def parseOptions():
   parser.add_argument('--dns-servers', type=str, default=None,
                       help='Comma-separated list of custom DNS servers (e.g., 8.8.8.8,1.1.1.1). Default: system resolvers.')
 
+  # First parse to get config file path (if specified)
+  args_temp = parser.parse_args()
+
+  # Load config file if specified or check for default locations
+  config_argv = []
+  config_file = args_temp.config or find_default_config_file()
+  if config_file:
+    config_argv = load_config_file(config_file)
+
+  # Merge config file arguments with command-line arguments (CLI takes precedence)
+  merged_argv = config_argv + sys.argv[1:]
+
+  # Re-parse with merged arguments
   global args
-  args = parser.parse_args()
+  args = parser.parse_args(merged_argv)
+
+  # Now log the config file load (after args is set)
+  if config_file and config_argv:
+    log(f"Loaded config from {config_file}", "debug")
 
   log("Parsed args:", "debug")
   log(f"Debug: {args.debug}", "debug")
@@ -350,6 +500,27 @@ def log(message, level):
     pass
   else:
     print(f"{datetime.now()} [{level.upper()}] {message}")
+
+def find_most_recent_records_file():
+  """Find the most recent records_YYYY-MM-DD.json file in the current directory.
+  Returns the filename if found, None otherwise."""
+  try:
+    # Match the pattern records_YYYY-MM-DD.json
+    pattern = "records_????-??-??.json"
+    matching_files = glob.glob(pattern)
+
+    if not matching_files:
+      log("No records files matching pattern 'records_YYYY-MM-DD.json' found", "error")
+      return None
+
+    # Sort by modification time, newest first
+    matching_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    most_recent = matching_files[0]
+    log(f"Found most recent records file: {most_recent}", "debug")
+    return most_recent
+  except Exception as e:
+    log(f"Error finding most recent records file: {e}", "error")
+    return None
 
 def retrySession(retries, session=None, backoff_factor=0.3):
   session = session or requests.Session()
@@ -987,11 +1158,21 @@ print(json.dumps(summary, indent=2))
 
 # If compare-to option is set, load previous records and compare (after summary/stats output)
 if hasattr(args, 'compare_to') and args.compare_to:
-    try:
-        with open(args.compare_to, 'r') as f:
-            previous_records = json.load(f)
+    compare_file = args.compare_to
+
+    # Handle special 'previous' value - find the most recent records file
+    if compare_file.lower() == 'previous':
+      compare_file = find_most_recent_records_file()
+      if not compare_file:
+        log("Cannot compare: no previous records file found", "error")
+        compare_file = None
+
+    if compare_file:
+      try:
+        with open(compare_file, 'r') as f:
+          previous_records = json.load(f)
         compare_records(records, previous_records)
-    except Exception as e:
+      except Exception as e:
         print(f"Error comparing to previous records: {e}")
 
 stats['finish_time'] = time.time()

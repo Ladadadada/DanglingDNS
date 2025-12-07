@@ -1,0 +1,12 @@
+{
+  "dangling-dns": {
+    "debug": false,
+    "score": 90,
+    "input": "./records.txt",
+    "compare-to": null,
+    "aws-route53": false,
+    "aws-profile": null,
+    "aws-region": "us-east-1",
+    "dns-servers": null
+  }
+}
